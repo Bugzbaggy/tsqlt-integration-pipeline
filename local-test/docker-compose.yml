@@ -1,0 +1,30 @@
+# Ephemeral SQL Server 2022 for AppDb_MSG integration/E2E tests (PROJ-000, Step 1).
+# Developer edition (free, non-expiring, feature-identical to Enterprise) — NOT the
+# default Evaluation edition, which expires after 180 days.
+#
+# The local-test/ directory is mounted read-only at /local-test so the container's own
+# sqlcmd can run bootstrap.sql and the seed scripts (sqlpackage runs on the host).
+services:
+  sqlserver:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: appdb_msg_test_sql
+    environment:
+      ACCEPT_EULA: "Y"
+      # Defaults keep the throwaway local password/port; db-up.sh/db-up.ps1 export
+      # SA_PASSWORD/HOST_PORT so their -SaPassword/-Port flags override without editing this file.
+      MSSQL_SA_PASSWORD: "${SA_PASSWORD:-Local_Test_P@ssw0rd1}"   # local-only; never a real secret
+      MSSQL_PID: "Developer"
+    ports:
+      - "${HOST_PORT:-14330}:1433"                # 14330 avoids clashing with a local default instance
+    volumes:
+      - ./:/local-test:ro
+    healthcheck:
+      # 2022 images ship mssql-tools18; sqlcmd there defaults to encrypted, so -C (trust cert) is required.
+      test: ["CMD-SHELL", "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P \"$$MSSQL_SA_PASSWORD\" -C -Q 'SELECT 1' || exit 1"]
+      interval: 5s
+      retries: 24
+      start_period: 15s
+    # Data on tmpfs: faster spin-up and guarantees nothing survives a container restart.
+    tmpfs:
+      - /var/opt/mssql/data
+      - /var/opt/mssql/log

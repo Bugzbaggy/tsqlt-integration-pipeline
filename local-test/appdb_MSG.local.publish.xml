@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Local/CI publish profile for the ephemeral AppDb_MSG test container (PROJ-000, Step 1).
+
+  Deploys INTO the database bootstrap.sql already created (CreateNewDatabase=False),
+  so the pre-created filegroups + DMK are reused. Server principals are excluded because
+  tests connect as sa (dbo) and don't need the 34 app_* logins / 45 users / 1,979 grants —
+  excluding them avoids orphaned-user and login-SID resolution failures on a fresh instance.
+
+  Shared publish options only. db-up.ps1/.sh drive the run and override the dynamic bits on
+  the CLI: /p:ExcludeObjectTypes (see below), the target DB name (AppDb_MSG_Dev / AppDb_SIT),
+  and every /v:SqlCmdVariable — AppDb_MSG_Data is pointed at the real AppDb_MSG_Data_Dev database so
+  the cross-DB synonyms resolve; the remaining cross-region targets are inert placeholders.
+  The SqlCmdVariable defaults below exist only for manual Visual Studio publishes.
+-->
+<Project ToolsVersion="14.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup>
+    <TargetDatabaseName>AppDb_MSG_Dev</TargetDatabaseName>
+    <CreateNewDatabase>False</CreateNewDatabase>
+    <BlockOnPossibleDataLoss>False</BlockOnPossibleDataLoss>
+    <DropObjectsNotInSource>False</DropObjectsNotInSource>
+    <!-- Reuse the files/DMK bootstrap.sql created; don't let DacFx re-place or resize them. -->
+    <IgnoreFilegroupPlacement>True</IgnoreFilegroupPlacement>
+    <IgnoreFileAndLogFilePath>True</IgnoreFileAndLogFilePath>
+    <IgnoreFileSize>True</IgnoreFileSize>
+    <!-- Server principals & grants are noise for sa-connected tests. NOTE: sqlpackage
+         IGNORES ExcludeObjectTypes when set in a .publish.xml profile (verified on
+         sqlpackage 16.x — it still tried CREATE LOGIN). db-up therefore passes
+         /p:ExcludeObjectTypes=Logins;Users;RoleMembership;Permissions;Credentials;...
+         on the CLI, where it is honored. Keep it out of this profile to avoid a
+         silently-ignored, misleading setting. -->
+    <IgnorePermissions>True</IgnorePermissions>
+    <IgnoreLoginSids>True</IgnoreLoginSids>
+    <IgnoreRoleMembership>True</IgnoreRoleMembership>
+    <IgnoreUserSettingsObjects>True</IgnoreUserSettingsObjects>
+    <AllowIncompatiblePlatform>True</AllowIncompatiblePlatform>
+    <VerifyDeployment>True</VerifyDeployment>
+  </PropertyGroup>
+  <ItemGroup>
+    <SqlCmdVariable Include="AppDb_MSG_Data"><Value>AppDb_MSG_Data_Dev</Value></SqlCmdVariable>
+    <SqlCmdVariable Include="AppDb_Analytics"><Value>AppDb_XDB_Stub</Value></SqlCmdVariable>
+    <SqlCmdVariable Include="AppDb_Connect"><Value>AppDb_XDB_Stub</Value></SqlCmdVariable>
+    <SqlCmdVariable Include="AppDb_Routing"><Value>AppDb_XDB_Stub</Value></SqlCmdVariable>
+    <SqlCmdVariable Include="AppDb_Support"><Value>AppDb_XDB_Stub</Value></SqlCmdVariable>
+    <SqlCmdVariable Include="ZenSphere"><Value>AppDb_XDB_Stub</Value></SqlCmdVariable>
+    <SqlCmdVariable Include="AppDb_Voice"><Value>AppDb_XDB_Stub</Value></SqlCmdVariable>
+    <SqlCmdVariable Include="LkSrv_MSG_ID"><Value>AppDb_XDB_Stub</Value></SqlCmdVariable>
+    <SqlCmdVariable Include="LkSrv_MSG_UK"><Value>AppDb_XDB_Stub</Value></SqlCmdVariable>
+  </ItemGroup>
+</Project>

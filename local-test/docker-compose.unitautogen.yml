@@ -1,0 +1,38 @@
+# Report-only overlay for docker-compose.yml — adds a "unitautogen" container that
+# fetches tSQLt + UnitAutogen (both pinned, nothing vendored) to generate tSQLt tests and
+# measure LINE COVERAGE against the already-published AppDb_Dev, emitting Cobertura +
+# JUnit into ./artifacts. Reuses the tools image (sqlcmd + curl + tar); the Jenkins/
+# Linux agent still needs only Docker.
+#
+#   docker compose -f local-test/docker-compose.yml up -d --wait                             # start SQL 2022
+#   docker compose -f local-test/docker-compose.yml -f local-test/docker-compose.ci.yml \
+#       run --rm --build tools                                                               # publish schema
+#   docker compose -f local-test/docker-compose.yml -f local-test/docker-compose.unitautogen.yml \
+#       run --rm --build unitautogen                                                         # coverage (report-only)
+services:
+  unitautogen:
+    build:
+      context: ..
+      dockerfile: local-test/tools.Dockerfile
+    depends_on:
+      sqlserver:
+        condition: service_healthy
+    environment:
+      # In-network: reach the sqlserver service directly on 1433 (not the host-mapped 14330).
+      SERVER: sqlserver
+      PORT: "1433"
+      SA_PASSWORD: "Local_Test_P@ssw0rd1"   # matches docker-compose.yml; throwaway, not a secret
+      MSG_DB: AppDb_Dev
+      # tSQLt (Apache-2.0) + UnitAutogen (AGPL) fetched at pinned versions by fetch-deps.sh.
+      TSQLT_DIR: /tmp/tsqlt
+      UA_DIR: /tmp/unitautogen
+      ARTIFACTS_DIR: /repo/artifacts       # -> workspace/artifacts on the agent, for junit/archive
+      UA_SCHEMAS: "${UA_SCHEMAS:-}"        # empty = every user schema; override to scope
+    volumes:
+      - ..:/repo
+    working_dir: /repo
+    # Fetch pinned deps (tSQLt + UnitAutogen), then run the report-only coverage sweep.
+    command:
+      - bash
+      - -c
+      - bash local-test/unitautogen/fetch-deps.sh && bash local-test/unitautogen/coverage.sh

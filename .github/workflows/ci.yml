@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  shellcheck:
+    name: Scripts parse
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: bash -n every script
+        run: |
+          fail=0
+          while IFS= read -r s; do bash -n "$s" || { echo "::error file=$s::parse error"; fail=1; }; done \
+            < <(find . -name '*.sh' -not -path './.git/*')
+          exit $fail
+      - name: node --check every mjs
+        run: |
+          fail=0
+          while IFS= read -r f; do node --check "$f" || { echo "::error file=$f::parse error"; fail=1; }; done \
+            < <(find . -name '*.mjs' -not -path './.git/*')
+          exit $fail
+
+  compose:
+    name: Compose files are valid
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate compose
+        run: |
+          for f in local-test/docker-compose*.yml; do
+            echo "--- $f"
+            SA_PASSWORD=dummy docker compose -f "$f" config -q || { echo "::error::$f invalid"; exit 1; }
+          done
+          echo 'Compose files valid.'
+
+  denylist:
+    name: Sensitive denylist is a valid regex
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Denylist classifies correctly
+        run: python skills/db-unit-test-synth/tests/check-denylist.py
+
+  leak-scan:
+    name: No internal identifiers
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Scan
+        run: |
+          PAT='\b(sg|uk|us|id|st)-db[0-9]\b|wavecell|[Mm]essage[Ss]phere|WC_[A-Za-z_]+'
+          PAT="$PAT"'|cpaas|CPAAS|8x8|\b(DBV|MSG|DBA)-[0-9]+\b'
+          if grep -rniE "$PAT" . --exclude-dir=.git --exclude-dir=.github; then
+            echo "::error::internal identifier found"; exit 1
+          fi
+          echo 'Leak scan clean.'

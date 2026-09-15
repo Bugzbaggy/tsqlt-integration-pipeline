@@ -1,0 +1,8 @@
+# Column-name denylist for production enum-domain sampling (scripts/sample-domains.sql).
+# A column is sampled ONLY if its name does NOT match this pattern AND it is low-cardinality
+# (COUNT(DISTINCT) <= 50). One case-insensitive extended-regex, OR-joined. Keep it broad —
+# when in doubt, deny (fall back to a synthetic value; coverage is unaffected).
+#
+# Rationale: we only ever want enum/status/type/category domains. Anything that could carry a
+# message body, an identifier, or PII must never leave the read-only replica as sample values.
+(?i)(msg|message|body|content|text|payload|note|comment|remark|reason|desc|description|subject|url|link|token|secret|api.?key|auth|password|pwd|hash|salt|signature|phone|mobile|msisdn|number|email|mail|addr|street|city|zip|postal|name|first|last|full|contact|user|login|account.?uid|customer|company|ip|mac|device|imei|iccid|imsi|pan|card|cvv|iban|bic|swift|dob|birth|gender|nationality|passport|nric|ssn|tax|otp|pin|lat|long|geo|coord)
