@@ -30,11 +30,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Validate compose
+      - name: Validate compose (base, then each overlay stacked on it)
         run: |
-          for f in local-test/docker-compose*.yml; do
-            echo "--- $f"
-            SA_PASSWORD=dummy docker compose -f "$f" config -q || { echo "::error::$f invalid"; exit 1; }
+          # docker-compose.yml is the BASE and defines the sqlserver service.
+          # The other files are OVERLAYS that add services depending on it, and
+          # are invoked as `-f docker-compose.yml -f <overlay>`. Validating an
+          # overlay on its own fails with "depends on undefined service".
+          set -e
+          base=local-test/docker-compose.yml
+          echo "--- $base"
+          SA_PASSWORD=dummy docker compose -f "$base" config -q
+          for overlay in local-test/docker-compose.*.yml; do
+            [ "$overlay" = "$base" ] && continue
+            echo "--- $base + $overlay"
+            SA_PASSWORD=dummy docker compose -f "$base" -f "$overlay" config -q
           done
           echo 'Compose files valid.'
 
