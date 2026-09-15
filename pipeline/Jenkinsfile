@@ -449,7 +449,7 @@ def postPrSummary() {
                tag=(db ~ /Data/)?" _(data DB)_":"";
                tests=($6+0)+($7+0)+($8+0)+($9+0); pass=$6+0; skip=$9+0;
                if($11+0>0){ lp=sprintf("%.1f%%",($10*100.0)/($11+0)) } else { lp="n/a" }
-               if($4=="0" || $5=="NOT_TESTABLE"){ tests="—"; pass="—"; skip="—"; lp="not testable" }
+               if($4=="0" || $5=="NOT_TESTABLE"){ tests="-"; pass="-"; skip="-"; lp="not testable" }
                print "| `" $1 "." $2 "` (" $3 ")" tag " | " tests " | " pass " | " skip " | " lp " | n/a |" }' artifacts/summary.*.txt | sort
       ''').trim()
 
@@ -554,40 +554,75 @@ def postPrSummary() {
 
       // ---- Scorecard headline (four numbers) + per-object table, styled after the UnitAutogen
       // coverage report. The deploy+VERIFY gate stays ABOVE the scorecard and is the ONLY blocker.
-      int sObj = 0, sGen = 0, sPass = 0, sFailErr = 0, sSkip = 0, sTests = 0, sCov = 0, sTot = 0
-      if (scoreRaw) {
-        String[] s = scoreRaw.split(/\s+/)
-        sObj = s[0] as int; sGen = s[1] as int; sPass = s[2] as int; sFailErr = s[3] as int
-        sSkip = s[4] as int; sTests = s[5] as int; sCov = s[6] as int; sTot = s[7] as int
+      //
+      // Declared one-per-line on purpose: `int a = 0, b = 0, ...` is a multi-declaration, which
+      // the Jenkins CPS transformer handles badly and can blow up at runtime (plain Groovy is
+      // fine, which is why it passed local testing but posted nothing on the first real build).
+      int sObj = 0
+      int sPass = 0
+      int sFailErr = 0
+      int sSkip = 0
+      int sTests = 0
+      int sCov = 0
+      int sTot = 0
+      String linePct = 'n/a'
+      String headlineNums = ''
+      String tableRows = ''
+      String totalRow = ''
+      // A COSMETIC formatting bug must never silence the whole comment. If anything in the
+      // scorecard build throws, log it loudly and fall back to the plain summary below.
+      boolean scorecardOk = true
+      try {
+        if (scoreRaw) {
+          String[] s = scoreRaw.split(/\s+/)
+          if (s.length >= 8) {
+            sObj = s[0] as int
+            sPass = s[2] as int
+            sFailErr = s[3] as int
+            sSkip = s[4] as int
+            sTests = s[5] as int
+            sCov = s[6] as int
+            sTot = s[7] as int
+          } else {
+            echo "Scorecard: unexpected counts line (${s.length} field(s)): '${scoreRaw}' — using zeros."
+          }
+        }
+        if (sTot > 0) { linePct = "${((sCov * 100) / sTot) as int}%" }
+        headlineNums = "**Line coverage ${linePct}**" + (sTot > 0 ? " _(${sCov}/${sTot} lines)_" : '') +
+          " &nbsp;&middot;&nbsp; **Branch coverage n/a**" +
+          " &nbsp;&middot;&nbsp; **Tests ${sTests}** _(${sPass} pass &middot; ${sSkip} skip &middot; ${sFailErr} fail)_" +
+          " &nbsp;&middot;&nbsp; **Autonomy 100%** _(${sTests}/${sTests} auto-generated)_"
+        if (rowsRaw) {
+          String[] rl = rowsRaw.split(/\r?\n/)
+          int cap = 20
+          tableRows = (rl.length <= cap ? rl.toList() : rl.toList().subList(0, cap)).join("\n")
+          if (rl.length > cap) { tableRows += "\n| _+${rl.length - cap} more objects_ | | | | | |" }
+        } else {
+          tableRows = "| _no procedures or functions changed_ | - | - | - | - | - |"
+        }
+        totalRow = "| **TOTAL - ${sObj} object" + (sObj == 1 ? '' : 's') + "** | **${sTests}** | **${sPass}** | **${sSkip}** | **${linePct}** | **n/a** |"
+      } catch (Throwable sce) {
+        scorecardOk = false
+        echo "PR summary: scorecard build FAILED (${sce.getClass().getName()}: ${sce.getMessage()}) — posting the plain summary instead."
       }
-      String linePct = sTot > 0 ? "${((sCov * 100) / sTot) as int}%" : 'n/a'
-      String headlineNums = "**Line coverage ${linePct}**" + (sTot > 0 ? " _(${sCov}/${sTot} lines)_" : '') +
-        " &nbsp;·&nbsp; **Branch coverage n/a**¹" +
-        " &nbsp;·&nbsp; **Tests ${sTests}** _(${sPass} pass · ${sSkip} skip · ${sFailErr} fail)_" +
-        " &nbsp;·&nbsp; **Autonomy 100%** _(${sTests}/${sTests} auto-generated)_"
 
-      String tableRows
-      if (rowsRaw) {
-        String[] rl = rowsRaw.split(/\r?\n/)
-        int cap = 20
-        tableRows = (rl.length <= cap ? rl.toList() : rl.toList().subList(0, cap)).join("\n")
-        if (rl.length > cap) tableRows += "\n| _+${rl.length - cap} more objects_ | | | | | |"
-      } else {
-        tableRows = "| _no procedures or functions changed_ | — | — | — | — | — |"
-      }
-      String totalRow = "| **TOTAL — ${sObj} object" + (sObj == 1 ? '' : 's') + "** | **${sTests}** | **${sPass}** | **${sSkip}** | **${linePct}** | **n/a** |"
+      // The scorecard section, or a plain equivalent if building it threw. Either way the
+      // gate row and the check table below are always posted.
+      String scorecardBlock = scorecardOk
+        ? "### :bar_chart: Coverage scorecard\n" +
+          "${headlineNums}\n\n" +
+          "| Schema.Object | Tests | Pass | Skip | Line % | Branch % |\n" +
+          "| --- | ---: | ---: | ---: | ---: | ---: |\n" +
+          "${tableRows}\n" +
+          "${totalRow}\n\n"
+        : "### :bar_chart: Coverage\n_The scorecard could not be rendered for this build (see the console log); the checks below are unaffected._\n\n"
 
       String body = "## :test_tube: Integration Test Result: ${headline}\n\n" +
         "Your PR's changes were deployed to a throwaway SQL Server 2022 and checked automatically. " +
         "**Only the deploy row below blocks your PR** - the coverage scorecard is auto-generated, informational, and never stops a merge.\n\n" +
-        "> **:closed_lock_with_key: Deploys cleanly & passes integrity checks — ${deployRow.replace('**','')}**\n" +
+        "> **:closed_lock_with_key: Deploys cleanly & passes integrity checks - ${deployRow.replace('**','')}**\n" +
         "> _The only gate: confirms your schema applies to a brand-new database with no errors._\n\n" +
-        "### :bar_chart: Coverage scorecard\n" +
-        "${headlineNums}\n\n" +
-        "| Schema.Object | Tests | Pass | Skip | Line % | Branch % |\n" +
-        "| --- | ---: | ---: | ---: | ---: | ---: |\n" +
-        "${tableRows}\n" +
-        "${totalRow}\n\n" +
+        scorecardBlock +
         "| Check | Result |\n" +
         "| --- | --- |\n" +
         "| Interface contract _(params & columns)_ | ${contractRow} |\n" +
@@ -595,8 +630,8 @@ def postPrSummary() {
         "| Hand-written regression tests | ${gateRow} |\n" +
         "| Full details & logs | [Build #${env.BUILD_NUMBER}](${env.BUILD_URL}) |\n" +
         whyBlock + "\n" +
-        "<sub>¹ **Branch %** is n/a for procedures/TVFs on SQL-for-Linux (row-existence branches aren't reachable via Extended Events) — that gap is exactly what hand-written `tests/curated/` tests cover; only scalar-function branches get a real %. " +
-        "**How to read this:** the deploy row is the gate; the scorecard is a machine best-effort and never blocks your PR — a red cell means \\\"regenerate a baseline\\\", not \\\"broken\\\". " +
+        "<sub>**Branch %** is n/a for procedures/TVFs on SQL-for-Linux (row-existence branches aren't reachable via Extended Events) - that gap is exactly what hand-written `tests/curated/` tests cover; only scalar-function branches get a real %. " +
+        "**How to read this:** the deploy row is the gate; the scorecard is a machine best-effort and never blocks your PR - a red cell means 'regenerate a baseline', not 'broken'. " +
         "Want a real regression test for logic you changed? A **ready-to-finish tSQLt starter** for each object is attached under `artifacts/starters/` - or run the `db-unit-test-synth` skill (see `tests/README.md`). Questions? Ping the DB team.</sub>"
       String esc = body.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n').replace('\r', '')
       def resp = httpRequest(
@@ -608,7 +643,9 @@ def postPrSummary() {
       echo "PR #${pr} integration-summary comment: HTTP ${resp.status}"
     }
   } catch (e) {
-    echo "PR summary comment skipped: ${e}"
+    // Louder than before: the first real build of the scorecard posted nothing and the old
+    // one-line message made it impossible to tell why from the console log.
+    echo "PR summary comment SKIPPED — ${e.getClass().getName()}: ${e.getMessage()}"
   }
 }
 

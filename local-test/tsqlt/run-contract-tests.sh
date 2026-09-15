@@ -85,7 +85,29 @@ done
 
 echo "==> [$LABEL] Running contract suite ..."
 if [ "$scoped" = "1" ]; then
-    for c in "${RUN_CLASSES[@]}"; do sqlq -d "$DB" -Q "SET NOCOUNT ON; EXEC tSQLt.Run '$c';" >/dev/null 2>&1 || true; done
+    # tSQLt.Run TRUNCATES tSQLt.TestResult on every call, so running one class per sqlcmd
+    # invocation left only the LAST class's rows behind — the totals, the JUnit report and the
+    # failure list were all computed from that single class. A PR touching N objects reported
+    # "1 run", and a genuine contract change on any earlier object was SILENTLY DISCARDED
+    # (observed: an 18-object scope reported "0 changed/failed" while mage_ai.CurrencyRate_Get
+    # was really failing). Run every class in ONE batch instead, copying TestResult into an
+    # accumulator after each Run, then restore the union so everything downstream is complete.
+    # Name is a computed column and Id is an identity, so neither is carried across.
+    run_sql="SET NOCOUNT ON;
+CREATE TABLE #acc (Class nvarchar(max), TestCase nvarchar(max), TranName nvarchar(max),
+                   Result nvarchar(max), Msg nvarchar(max), TestStartTime datetime2, TestEndTime datetime2);"
+    for c in "${RUN_CLASSES[@]}"; do
+        esc=${c//\'/\'\'}
+        run_sql="$run_sql
+BEGIN TRY EXEC tSQLt.Run '$esc'; END TRY BEGIN CATCH END CATCH;
+INSERT #acc (Class,TestCase,TranName,Result,Msg,TestStartTime,TestEndTime)
+  SELECT Class,TestCase,TranName,Result,Msg,TestStartTime,TestEndTime FROM tSQLt.TestResult;"
+    done
+    run_sql="$run_sql
+DELETE FROM tSQLt.TestResult;
+INSERT INTO tSQLt.TestResult (Class,TestCase,TranName,Result,Msg,TestStartTime,TestEndTime)
+  SELECT Class,TestCase,TranName,Result,Msg,TestStartTime,TestEndTime FROM #acc ORDER BY TestStartTime;"
+    sqlq -d "$DB" -Q "$run_sql" >/dev/null 2>&1 || true
 else
     sqlq -d "$DB" -Q "SET NOCOUNT ON; EXEC tSQLt.RunAll;" >/dev/null 2>&1 || true
 fi
