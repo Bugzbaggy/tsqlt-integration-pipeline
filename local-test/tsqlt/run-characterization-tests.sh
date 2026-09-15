@@ -80,7 +80,25 @@ done
 
 echo "==> [$LABEL] Running characterization suite ..."
 if [ "$scoped" = "1" ]; then
-    for c in "${RUN_CLASSES[@]}"; do sqlq -d "$DB" -Q "SET NOCOUNT ON; EXEC tSQLt.Run '$c';" >/dev/null 2>&1 || true; done
+    # Same defect as run-contract-tests.sh: tSQLt.Run TRUNCATES tSQLt.TestResult on every call,
+    # so one-class-per-invocation left only the LAST class's rows — under-reporting the count and
+    # silently discarding a real behaviour change on any earlier object. Run every class in ONE
+    # batch, accumulate after each Run, then restore the union. Name is computed, Id is identity.
+    run_sql="SET NOCOUNT ON;
+CREATE TABLE #acc (Class nvarchar(max), TestCase nvarchar(max), TranName nvarchar(max),
+                   Result nvarchar(max), Msg nvarchar(max), TestStartTime datetime2, TestEndTime datetime2);"
+    for c in "${RUN_CLASSES[@]}"; do
+        esc=${c//\'/\'\'}
+        run_sql="$run_sql
+BEGIN TRY EXEC tSQLt.Run '$esc'; END TRY BEGIN CATCH END CATCH;
+INSERT #acc (Class,TestCase,TranName,Result,Msg,TestStartTime,TestEndTime)
+  SELECT Class,TestCase,TranName,Result,Msg,TestStartTime,TestEndTime FROM tSQLt.TestResult;"
+    done
+    run_sql="$run_sql
+DELETE FROM tSQLt.TestResult;
+INSERT INTO tSQLt.TestResult (Class,TestCase,TranName,Result,Msg,TestStartTime,TestEndTime)
+  SELECT Class,TestCase,TranName,Result,Msg,TestStartTime,TestEndTime FROM #acc ORDER BY TestStartTime;"
+    sqlq -d "$DB" -Q "$run_sql" >/dev/null 2>&1 || true
 else
     sqlq -d "$DB" -Q "SET NOCOUNT ON; EXEC tSQLt.RunAll;" >/dev/null 2>&1 || true
 fi
