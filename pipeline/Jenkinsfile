@@ -429,13 +429,16 @@ def postPrSummary() {
       ''').trim()
 
       // Scorecard headline sums (per-TEST, not per-object): objTotal genObjs sumPass sumFailErr
-      // sumSkip sumTests covLines totLines. Feeds the four headline numbers.
+      // sumSkip sumTests covLines totLines notTestable genFailed. Feeds the four stat cards
+      // and the subtitle line. Every value is derived from the run - nothing is assumed.
       String scoreRaw = sh(returnStdout: true, script: '''
         ls artifacts/summary.*.txt >/dev/null 2>&1 || exit 0
-        awk 'BEGIN{FS="~[|]~"; ob=0;gn=0;tp=0;tfe=0;ts=0;cc=0;vv=0}
-             { ob++; if($4=="1")gn++; tp+=$6+0; tfe+=($7+0)+($8+0); ts+=$9+0;
+        awk 'BEGIN{FS="~[|]~"; ob=0;gn=0;tp=0;tfe=0;ts=0;cc=0;vv=0;nt=0;gf=0}
+             { ob++; if($4=="1")gn++;
+               if($5=="NOT_TESTABLE") nt++; else if($4=="0") gf++;
+               tp+=$6+0; tfe+=($7+0)+($8+0); ts+=$9+0;
                if($4=="1" && $5!="NOT_TESTABLE"){ cc+=$10+0; vv+=$11+0 } }
-             END{ printf "%d %d %d %d %d %d %d %d", ob,gn,tp,tfe,ts,tp+tfe+ts,cc,vv }' artifacts/summary.*.txt
+             END{ printf "%d %d %d %d %d %d %d %d %d %d", ob,gn,tp,tfe,ts,tp+tfe+ts,cc,vv,nt,gf }' artifacts/summary.*.txt
       ''').trim()
 
       // Per-object scorecard rows (one markdown table row per changed object). Branch % is always
@@ -449,9 +452,17 @@ def postPrSummary() {
                tag=(db ~ /Data/)?" _(data DB)_":"";
                tests=($6+0)+($7+0)+($8+0)+($9+0); pass=$6+0; skip=$9+0;
                if($11+0>0){ lp=sprintf("%.1f%%",($10*100.0)/($11+0)) } else { lp="n/a" }
-               if($4=="0" || $5=="NOT_TESTABLE"){ tests="-"; pass="-"; skip="-"; lp="not testable" }
+               # Keep the REAL counts even when the object is not testable: UnitAutogen still
+               # records a placeholder skipped test, and that test IS counted in the TOTAL row.
+               # Blanking the cells made the visible rows fail to add up to the TOTAL (observed
+               # live: rows showed 0 tests while TOTAL claimed 1). "not testable" in Line % already
+               # says why nothing was exercised.
+               if($4=="0" || $5=="NOT_TESTABLE"){ lp="not testable" }
                print "| `" $1 "." $2 "` (" $3 ")" tag " | " tests " | " pass " | " skip " | " lp " | n/a |" }' artifacts/summary.*.txt | sort
       ''').trim()
+
+      // Subtitle date. Computed in the shell so we never touch new Date()/format() under CPS.
+      String runDate = sh(returnStdout: true, script: 'date -u +%Y-%m-%d').trim()
 
       // Verdict from the build result. The deploy+VERIFY gate and the curated tSQLt gate both
       // decide pass/fail; the coverage stage is report-only and never fails the build. GitHub
@@ -462,10 +473,17 @@ def postPrSummary() {
       String deployRow = failed ? ':x: **Failed** - see the log' : ':white_check_mark: **Passed** - schema deployed, all integrity checks OK'
 
       // Curated regression-test row (report-only). Optional, hand-written tSQLt tests.
+      int curTests = 0
+      int curBad = 0
       String gateRow
       if (gateRaw) {
         String[] g = gateRaw.split(/\s+/)
-        int gt = g[0] as int, gbad = (g[1] as int) + (g[2] as int)
+        if (g.length >= 3) {
+          curTests = g[0] as int
+          curBad = (g[1] as int) + (g[2] as int)
+        }
+        int gt = curTests
+        int gbad = curBad
         gateRow = gt == 0 ? 'None added yet (the curated suite is empty)'
                 : (gbad > 0 ? ":x: **${gbad} of ${gt} failed**"
                             : ":white_check_mark: all ${gt} passed")
@@ -477,6 +495,11 @@ def postPrSummary() {
       String allObjs = ((env.UA_OBJECTS ?: '') + ' ' + (env.UA_DATA_OBJECTS ?: '')).trim().replaceAll(/\s+/, ' ')
       boolean noTestable = !allObjs
       String notRunMsg = '_not run - your PR changed no stored procedure or function_'
+      // Characterization only covers DETERMINISTIC SCALAR FUNCTIONS. Reusing notRunMsg made the
+      // Behaviour row read 'your PR changed no stored procedure or function' directly above a
+      // table listing 16 changed procedures (observed live: rows read that message directly
+      // above such a table) - true for contract, false here.
+      String charNotRunMsg = '_not run - your PR changed no deterministic scalar function_'
 
       // Objects changed (procs/functions actually assessed). Fall back to the git-computed
       // list if the report produced no rows (e.g. coverage stage skipped or errored).
@@ -544,11 +567,11 @@ def postPrSummary() {
       if (charRaw) {
         String[] h = charRaw.split(/\s+/)
         int ht = (h[0] ?: '0') as int, hbad = (h.length > 1 ? h[1] : '0') as int
-        charRow = ht == 0 ? notRunMsg
+        charRow = ht == 0 ? charNotRunMsg
                 : (hbad > 0 ? ":warning: **${hbad} of ${ht} changed** - regenerate the baseline if intended"
                             : ":white_check_mark: all ${ht} unchanged")
       } else {
-        charRow = notRunMsg
+        charRow = charNotRunMsg
       }
       String mChar = 'Auto-generated behaviour checks for the deterministic scalar functions you changed: the function still returns the same output for a fixed sample input. A change just asks you to regenerate the baseline; it never blocks your PR.'
 
@@ -565,8 +588,11 @@ def postPrSummary() {
       int sTests = 0
       int sCov = 0
       int sTot = 0
+      int sNotTestable = 0
+      int sGenFailed = 0
       String linePct = 'n/a'
-      String headlineNums = ''
+      String subtitle = ''
+      String cardBlock = ''
       String tableRows = ''
       String totalRow = ''
       // A COSMETIC formatting bug must never silence the whole comment. If anything in the
@@ -583,15 +609,34 @@ def postPrSummary() {
             sTests = s[5] as int
             sCov = s[6] as int
             sTot = s[7] as int
+            if (s.length >= 10) {
+              sNotTestable = s[8] as int
+              sGenFailed = s[9] as int
+            }
           } else {
-            echo "Scorecard: unexpected counts line (${s.length} field(s)): '${scoreRaw}' — using zeros."
+            echo "Scorecard: unexpected counts line (${s.length} field(s)): '${scoreRaw}' - using zeros."
           }
         }
-        if (sTot > 0) { linePct = "${((sCov * 100) / sTot) as int}%" }
-        headlineNums = "**Line coverage ${linePct}**" + (sTot > 0 ? " _(${sCov}/${sTot} lines)_" : '') +
-          " &nbsp;&middot;&nbsp; **Branch coverage n/a**" +
-          " &nbsp;&middot;&nbsp; **Tests ${sTests}** _(${sPass} pass &middot; ${sSkip} skip &middot; ${sFailErr} fail)_" +
-          " &nbsp;&middot;&nbsp; **Autonomy 100%** _(${sTests}/${sTests} auto-generated)_"
+        // One decimal like the reference report, via integer math (CPS-safe: no String.format).
+        if (sTot > 0) {
+          // Round to the nearest tenth. Truncating disagreed with the per-object rows, which
+          // use sprintf("%.1f") and DO round - live example: 6/14 showed 42% where the true
+          // value is 42.857%. (x*2000 + tot) / (2*tot) is round-half-up in integer math.
+          int tenths = ((sCov * 2000 + sTot) / (2 * sTot)) as int
+          linePct = "${tenths.intdiv(10)}.${tenths % 10}%"
+        }
+        int sTestable = sObj - sNotTestable
+        subtitle = "<sub>${env.MSG_DB} + ${env.DATA_DB} &middot; ${runDate} &middot; build #${env.BUILD_NUMBER} &middot; " +
+          "${sObj} object" + (sObj == 1 ? '' : 's') + " (${sTestable} testable &middot; ${sNotTestable} not testable &middot; ${sGenFailed} failed generation)</sub>"
+        // Stat cards. GitHub strips <style>/class, so the cards are an HTML table with a big
+        // numeral per cell - attributes are UNQUOTED so the JSON escaping below stays trivial.
+        String autonomyPct = sTests > 0 ? '100%' : 'n/a'
+        cardBlock = "<table>\n<tr>\n" +
+          "<td align=center><h2>${linePct}</h2><b>Line coverage</b><br><sub>" + (sTot > 0 ? "${sCov} / ${sTot} lines" : "nothing measurable") + "</sub></td>\n" +
+          "<td align=center><h2>${curTests}</h2><b>Hand-written</b><br><sub>" + (curTests == 0 ? "none added yet" : "${curTests - curBad} pass &middot; ${curBad} fail") + "</sub></td>\n" +
+          "<td align=center><h2>${sTests}</h2><b>Tests</b><br><sub>${sPass} pass &middot; ${sSkip} skip &middot; ${sFailErr} fail</sub></td>\n" +
+          "<td align=center><h2>${autonomyPct}</h2><b>Autonomy</b><br><sub>${sTests} of ${sTests} auto-generated</sub></td>\n" +
+          "</tr>\n</table>"
         if (rowsRaw) {
           String[] rl = rowsRaw.split(/\r?\n/)
           int cap = 20
@@ -600,17 +645,19 @@ def postPrSummary() {
         } else {
           tableRows = "| _no procedures or functions changed_ | - | - | - | - | - |"
         }
-        totalRow = "| **TOTAL - ${sObj} object" + (sObj == 1 ? '' : 's') + "** | **${sTests}** | **${sPass}** | **${sSkip}** | **${linePct}** | **n/a** |"
+        totalRow = "| **TOTAL - ${sObj} object" + (sObj == 1 ? '' : 's') +
+          " (${sObj - sNotTestable} testable, ${sNotTestable} not)** | **${sTests}** | **${sPass}** | **${sSkip}** | **${linePct}** | **n/a** |"
       } catch (Throwable sce) {
         scorecardOk = false
-        echo "PR summary: scorecard build FAILED (${sce.getClass().getName()}: ${sce.getMessage()}) — posting the plain summary instead."
+        echo "PR summary: scorecard build FAILED (${sce.getClass().getName()}: ${sce.getMessage()}) - posting the plain summary instead."
       }
 
       // The scorecard section, or a plain equivalent if building it threw. Either way the
       // gate row and the check table below are always posted.
       String scorecardBlock = scorecardOk
-        ? "### :bar_chart: Coverage scorecard\n" +
-          "${headlineNums}\n\n" +
+        ? "### :bar_chart: Database Coverage Report\n" +
+          "${subtitle}\n\n" +
+          "${cardBlock}\n\n" +
           "| Schema.Object | Tests | Pass | Skip | Line % | Branch % |\n" +
           "| --- | ---: | ---: | ---: | ---: | ---: |\n" +
           "${tableRows}\n" +
@@ -630,7 +677,8 @@ def postPrSummary() {
         "| Hand-written regression tests | ${gateRow} |\n" +
         "| Full details & logs | [Build #${env.BUILD_NUMBER}](${env.BUILD_URL}) |\n" +
         whyBlock + "\n" +
-        "<sub>**Branch %** is n/a for procedures/TVFs on SQL-for-Linux (row-existence branches aren't reachable via Extended Events) - that gap is exactly what hand-written `tests/curated/` tests cover; only scalar-function branches get a real %. " +
+        "<sub>_Tests auto-generated by UnitAutogen (AGPL-3.0) and run with tSQLt (Apache-2.0), both pinned in `local-test/unitautogen/fetch-deps.sh`; coverage measured on the throwaway DB this build published._</sub>\n\n" +
+        "<sub>**Branch coverage is not reported.** UnitAutogen records it, but on SQL-for-Linux the UNSAFE CLR predicate parser cannot load (SAFE-only), so branch seeding is degraded and the numbers are not trustworthy - line coverage and test pass/fail are the reliable signals. Hand-written `tests/curated/` tests are what actually cover the branch logic, which is why they have their own card. " +
         "**How to read this:** the deploy row is the gate; the scorecard is a machine best-effort and never blocks your PR - a red cell means 'regenerate a baseline', not 'broken'. " +
         "Want a real regression test for logic you changed? A **ready-to-finish tSQLt starter** for each object is attached under `artifacts/starters/` - or run the `db-unit-test-synth` skill (see `tests/README.md`). Questions? Ping the DB team.</sub>"
       String esc = body.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n').replace('\r', '')
