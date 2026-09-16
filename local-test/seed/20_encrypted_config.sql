@@ -7,7 +7,7 @@
 -- (see ipm.ChannelRouteCredentialConfig_AddOrUpdate).
 --
 -- ipm.ChannelRouteCredentialConfig FKs to ipm.Channel (ChannelId, UNIQUEIDENTIFIER)
--- and rt.SupplierConn (ConnUid, SMALLINT) — both have their own parent chains that
+-- and route.VendorConn (ConnUid, SMALLINT) — both have their own parent chains that
 -- are scenario-specific. This script therefore runs only when such parents already
 -- exist (e.g. seeded by a scenario), and otherwise skips cleanly. Adapt the SELECTs
 -- to your scenario's real ChannelId/ConnUid.
@@ -20,11 +20,11 @@ SET ANSI_NULLS ON;
 GO
 
 DECLARE @ChannelId UNIQUEIDENTIFIER = (SELECT MIN(ChannelId) FROM ipm.Channel);
-DECLARE @ConnUid   SMALLINT         = (SELECT MIN(ConnUid)   FROM rt.SupplierConn);
+DECLARE @ConnUid   SMALLINT         = (SELECT MIN(ConnUid)   FROM route.VendorConn);
 
 IF @ChannelId IS NULL OR @ConnUid IS NULL
 BEGIN
-    PRINT 'Seed 20_encrypted_config.sql skipped: no ipm.Channel / rt.SupplierConn parent rows yet.';
+    PRINT 'Seed 20_encrypted_config.sql skipped: no ipm.Channel / route.VendorConn parent rows yet.';
     RETURN;
 END
 

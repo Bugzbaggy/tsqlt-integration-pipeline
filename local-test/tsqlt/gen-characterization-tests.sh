@@ -64,7 +64,7 @@ INPUT_EXPR="(SELECT STRING_AGG(CASE
    WHERE p.object_id=OBJECT_ID(@FQ) AND p.parameter_id>0)"
 
 # Slice 2b: type-matched column value for seeding a faked dependency table — the SAME type->value
-# map as INPUT_EXPR, so a `WHERE col = @param` filter matches (proven on cp.fnGetAccountUid). Bit
+# map as INPUT_EXPR, so a `WHERE col = @param` filter matches (proven on core.fnGetAccountUid). Bit
 # seeds 0 to satisfy the common `Deleted = 0` soft-delete filter.
 COLVAL="CASE WHEN t.name IN ('bigint','int','smallint','tinyint') THEN '1'
      WHEN t.name='bit' THEN '0'
@@ -134,7 +134,7 @@ while IFS= read -r line; do
     while IFS= read -r dep; do
       [ -z "$dep" ] && continue
       fake+="    EXEC tSQLt.FakeTable '$dep';"$'\n'
-      # Bracket the table name (QUOTENAME/PARSENAME) so a reserved-word table like map.[User] is
+      # Bracket the table name (QUOTENAME/PARSENAME) so a reserved-word table like cfg.[User] is
       # valid in the INSERT; columns are already bracketed via QUOTENAME(c.name).
       ins="$(q "SELECT 'INSERT '+QUOTENAME(PARSENAME('$dep',2))+'.'+QUOTENAME(PARSENAME('$dep',1))+' ('+STRING_AGG(QUOTENAME(c.name COLLATE DATABASE_DEFAULT),', ')+') VALUES ('+STRING_AGG($COLVAL,', ')+');'
                 FROM sys.columns c JOIN sys.types t ON t.user_type_id=c.user_type_id

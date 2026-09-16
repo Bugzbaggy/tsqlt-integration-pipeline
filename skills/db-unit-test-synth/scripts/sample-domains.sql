@@ -15,8 +15,8 @@
 SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
 SET LOCK_TIMEOUT 3000;
 
-DECLARE @Schema sysname = N'rt';
-DECLARE @Table  sysname = N'RoutingPlanCoverage';
+DECLARE @Schema sysname = N'route';
+DECLARE @Table  sysname = N'PlanCoverage';
 DECLARE @MaxCardinality int = 50;
 DECLARE @Top int = 50;
 

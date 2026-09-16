@@ -5,7 +5,7 @@
 # needs production. Claude fills the empty "branches" array by reading "definition".
 #
 # Usage:  SERVER=localhost PORT=1433 SA_PASSWORD=... DB=AppDb_Dev \
-#           bash introspect.sh rt.fnSubAccountRoutingGroup > fixture.json
+#           bash introspect.sh route.fnSubAccountGroup > fixture.json
 #
 # Env matches the other generators: SERVER PORT SA_PASSWORD SQLCMD_ENC DB.
 set -euo pipefail

@@ -53,7 +53,7 @@ IF @roundtrip IS NULL OR @roundtrip <> @plain
     THROW 50005, 'Encryption round-trip failed: DMK/cert/key chain is not usable.', 1;
 PRINT CONCAT('  [OK] encryption chain: DMK + ', @certs, ' certs, round-trip verified.');
 
--- 3. Filegroup files present -> the only partitioned table (rt.PriceListHistory)
+-- 3. Filegroup files present -> the only partitioned table (route.PriceListHistory)
 --    exists on its partition scheme. Fails if bootstrap.sql skipped the FG files.
 IF EXISTS (
     SELECT 1 FROM sys.filegroups fg
@@ -66,15 +66,15 @@ IF NOT EXISTS (
     JOIN sys.indexes i ON i.object_id = t.object_id AND i.index_id <= 1
     JOIN sys.data_spaces ds ON ds.data_space_id = i.data_space_id
     WHERE t.name = 'PriceListHistory' AND ds.type = 'PS')
-    THROW 50007, 'rt.PriceListHistory is missing or not on a partition scheme (FG files?).', 1;
-PRINT '  [OK] filegroups have files; rt.PriceListHistory partitioned.';
+    THROW 50007, 'route.PriceListHistory is missing or not on a partition scheme (FG files?).', 1;
+PRINT '  [OK] filegroups have files; route.PriceListHistory partitioned.';
 
 -- 4. MsgIntTest seed present and correctly linked.
-IF NOT EXISTS (SELECT 1 FROM cp.Account WHERE AccountId = 'MsgIntTest')
-    THROW 50008, 'Seed missing: cp.Account MsgIntTest not found.', 1;
+IF NOT EXISTS (SELECT 1 FROM core.Account WHERE AccountId = 'MsgIntTest')
+    THROW 50008, 'Seed missing: core.Account MsgIntTest not found.', 1;
 IF NOT EXISTS (
-    SELECT 1 FROM ms.SubAccount sa
-    JOIN cp.Account a ON a.AccountUid = sa.AccountUid
+    SELECT 1 FROM svc.SubAccount sa
+    JOIN core.Account a ON a.AccountUid = sa.AccountUid
     WHERE a.AccountId = 'MsgIntTest' AND sa.SubAccountId = 'MsgIntTest_1' AND sa.Product_SMS = 1)
     THROW 50009, 'Seed missing: SMS-enabled subaccount MsgIntTest_1 not linked to MsgIntTest.', 1;
 PRINT '  [OK] seed present: MsgIntTest account + SMS subaccount.';
@@ -82,7 +82,7 @@ PRINT '  [OK] seed present: MsgIntTest account + SMS subaccount.';
 -- 5. Symmetric-key blocker workaround: WebAppFactory.GetApiKey() equivalent.
 --    Execute the real proc and confirm it decrypts back to the seeded plaintext,
 --    proving the fresh-cert re-encryption approach makes auth-dependent tests viable.
-IF EXISTS (SELECT 1 FROM ms.AuthApi WHERE Name = N'MsgIntTest API Key')
+IF EXISTS (SELECT 1 FROM svc.AuthApi WHERE Name = N'MsgIntTest API Key')
 BEGIN
     DECLARE @keys TABLE (ApiKey VARCHAR(3000), ApiKeyId INT, AccountId VARCHAR(50), SubAccountId VARCHAR(50));
     INSERT @keys EXEC smsapi.AuthApi_GetApiKeys;

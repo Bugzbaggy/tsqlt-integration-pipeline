@@ -31,7 +31,7 @@ plus a short list of objects whose behaviour encodes a business rule (money, rou
 
 - **No argument** — objects changed on this branch: `git diff dev...HEAD --name-only -- 'AppDb_MSG/**/*.sql' 'AppDb_MSG_data/**/*.sql'`.
 - **`schema.object`** (one or more) — exactly those objects.
-- **`schema`** (e.g. `rt`) — every SP/function/view in that schema, both DBs.
+- **`schema`** (e.g. `route`) — every SP/function/view in that schema, both DBs.
 - **`.`** — full backfill across `AppDb_MSG` + `AppDb_MSG_data` (large; work schema-by-schema).
 
 AppDb_MSG objects live in DB `AppCatalog` on SG / `AppDb` in ID-UK-US / `AppDb_Dev` in CI.
@@ -45,7 +45,7 @@ throwaway DB; locally, your `db-up.sh` container. **Structure never requires pro
 
 ```bash
 SERVER=localhost PORT=1433 SA_PASSWORD=... DB=AppDb_Dev \
-  bash .claude/skills/db-unit-test-synth/scripts/introspect.sh rt.fnSubAccountRoutingGroup > /tmp/fixture.rt.fnSubAccountRoutingGroup.json
+  bash .claude/skills/db-unit-test-synth/scripts/introspect.sh route.fnSubAccountGroup > /tmp/fixture.route.fnSubAccountGroup.json
 ```
 
 It emits a fixture skeleton: signature, referenced tables (what to `FakeTable`), each dep table's columns
@@ -84,7 +84,7 @@ from step 1. Prefer the real domain values from step 2. Record them in `branches
 ```json
 "branches": [
   { "id": "default-plan/any-operator wins",
-    "seed": [ {"table":"rt.RoutingPlanCoverage","row":{"RoutingPlanId":500,"Country":"AF","OperatorId":null,"TrafficCategory":"DEF","RoutingGroupId":111,"Deleted":0}} ],
+    "seed": [ {"table":"route.PlanCoverage","row":{"RoutingPlanId":500,"Country":"AF","OperatorId":null,"TrafficCategory":"DEF","RoutingGroupId":111,"Deleted":0}} ],
     "call": {"args":["108","AF"]},
     "needs_human_oracle": false },
   { "id": "deleted coverage excluded even when country passed",
@@ -99,7 +99,7 @@ where "current output" is not self-evidently "correct output" — that branch be
 
 ### 4. Emit the test + capture the golden baseline
 ```bash
-node .claude/skills/db-unit-test-synth/scripts/emit-tsqlt.mjs /tmp/fixture.rt.fnSubAccountRoutingGroup.json > tests/characterization/AppDb_MSG/rt.gen.sql
+node .claude/skills/db-unit-test-synth/scripts/emit-tsqlt.mjs /tmp/fixture.route.fnSubAccountGroup.json > tests/characterization/AppDb_MSG/route.gen.sql
 ```
 The emitter writes one tSQLt class per object: `FakeTable`s every dep, seeds each branch's rows inside a
 rolled-back transaction, calls the object, and writes an `AssertEquals` **against a placeholder** expected.

@@ -18,25 +18,25 @@ function emit(fixture, args = []) {
 }
 
 const baseTables = [{
-  schema: 'rt', table: 'T', columns: [
+  schema: 'route', table: 'T', columns: [
     { name: 'Id', type: 'int' }, { name: 'Name', type: 'nvarchar' }, { name: 'Flag', type: 'bit' },
     { name: 'When', type: 'datetime2' }, { name: 'Amt', type: 'decimal' },
   ],
 }];
 const base = (branches) => ({
-  object: 'rt.fnX', db: 'AppDb_Dev', type: 'SQL_SCALAR_FUNCTION',
-  signature: [], fake: [{ schema: 'rt', table: 'T' }], tables: baseTables,
+  object: 'route.fnX', db: 'AppDb_Dev', type: 'SQL_SCALAR_FUNCTION',
+  signature: [], fake: [{ schema: 'route', table: 'T' }], tables: baseTables,
   fk_closure: [], checks: [], definition: 'x', branches,
 });
 
 // --- 1. SQL injection / quote escaping in a seed value
 {
-  const evil = "Robert'); DROP TABLE rt.T; --";
+  const evil = "Robert'); DROP TABLE route.T; --";
   const out = emit(base([{
-    id: 'injection', seed: [{ table: 'rt.T', row: { Id: 1, Name: evil } }],
+    id: 'injection', seed: [{ table: 'route.T', row: { Id: 1, Name: evil } }],
     assert: { actual_expr: 'SELECT 1', expected: 1 }, needs_human_oracle: false,
   }]));
-  check('injection: single quotes are doubled (escaped)', out.includes("N'Robert''); DROP TABLE rt.T; --'"), );
+  check('injection: single quotes are doubled (escaped)', out.includes("N'Robert''); DROP TABLE route.T; --'"), );
   check('injection: no unescaped break-out of the string literal',
         !/VALUES \(1, N'Robert'\); DROP/.test(out));
 }
@@ -44,7 +44,7 @@ const base = (branches) => ({
 // --- 2. Type formatting: NULL, bit, numeric, date, string
 {
   const out = emit(base([{
-    id: 'types', seed: [{ table: 'rt.T', row: { Id: 7, Name: null, Flag: true, When: '2026-01-02', Amt: 12.5 } }],
+    id: 'types', seed: [{ table: 'route.T', row: { Id: 7, Name: null, Flag: true, When: '2026-01-02', Amt: 12.5 } }],
     assert: { actual_expr: 'SELECT 1', expected: 1 }, needs_human_oracle: false,
   }]));
   check('types: NULL emitted unquoted', /,\s*NULL\s*,/.test(out), );
@@ -56,7 +56,7 @@ const base = (branches) => ({
 // --- 3. Never fabricate an expected: missing expected => smoke assert only
 {
   const out = emit(base([{
-    id: 'no expected', seed: [{ table: 'rt.T', row: { Id: 1 } }],
+    id: 'no expected', seed: [{ table: 'route.T', row: { Id: 1 } }],
     assert: { actual_expr: 'SELECT 1' }, needs_human_oracle: false,
   }]));
   check('no-expected: does NOT emit AssertEquals with a made-up value', !out.includes('AssertEquals @Expected ='));
@@ -66,7 +66,7 @@ const base = (branches) => ({
 // --- 4. needs_human_oracle => curated stub, never an auto expected
 {
   const out = emit(base([{
-    id: 'money rule', seed: [{ table: 'rt.T', row: { Id: 1 } }],
+    id: 'money rule', seed: [{ table: 'route.T', row: { Id: 1 } }],
     assert: { actual_expr: 'SELECT 1', expected: 999 }, needs_human_oracle: true,
   }]));
   check('oracle: routed to a CURATED STUB', out.includes('CURATED STUB'));
@@ -91,7 +91,7 @@ const base = (branches) => ({
 
 // --- 7. Determinism
 {
-  const fx = base([{ id: 'd', seed: [{ table: 'rt.T', row: { Id: 1, Name: 'a' } }], assert: { actual_expr: 'SELECT 1', expected: 1 } }]);
+  const fx = base([{ id: 'd', seed: [{ table: 'route.T', row: { Id: 1, Name: 'a' } }], assert: { actual_expr: 'SELECT 1', expected: 1 } }]);
   check('determinism: two emits are byte-identical', emit(fx) === emit(fx));
 }
 

@@ -30,21 +30,21 @@ run_one(){ # label db object
   if DB="$2" bash "$SKILL" "$3" > "$OUT/$1.json" 2>"$OUT/$1.err"
   then pass "introspect [$1] $3"; else fail "introspect [$1] $3" "$(head -3 "$OUT/$1.err" | tr '\n' ' ')"; fi
 }
-run_one scalar_fn   "$MSG_DB"  cls.fnClassificationTemplateError
+run_one scalar_fn   "$MSG_DB"  clsf.fnClassificationError
 run_one inline_tvf  "$MSG_DB"  dbo.SplitStrings_XML
-run_one proc        "$MSG_DB"  map.RoutingManager_SupplierList
-run_one multi_tvf   "$MSG_DB"  cp.fnSubAccount_GetByFilter
-run_one trigger     "$MSG_DB"  cls.Category_DataChanged
-run_one table       "$MSG_DB"  ms.Survey
-run_one view        "$MSG_DB"  rt.vwRoutingTier
-run_one big_defn    "$MSG_DB"  map.PricingPlanFutureStaging_Validate   # ~28k chars: multi-chunk base64
-run_one no_deps     "$MSG_DB"  cp.CmGroup_ContactDelete                # zero dependency tables
-run_one synonym_ref "$MSG_DB"  cp.Report_SmsTraffic_GetOperators       # dm_sql_referenced_entities can throw
-run_one data_db     "$DATA_DB" cp.AccountWallet_Change_InRegion        # per-DB routing
+run_one proc        "$MSG_DB"  cfg.RouteManager_VendorList
+run_one multi_tvf   "$MSG_DB"  core.fnSubAccount_GetByFilter
+run_one trigger     "$MSG_DB"  clsf.Category_DataChanged
+run_one table       "$MSG_DB"  svc.Survey
+run_one view        "$MSG_DB"  route.vwTier
+run_one big_defn    "$MSG_DB"  cfg.PricingPlanStaging_Validate   # ~28k chars: multi-chunk base64
+run_one no_deps     "$MSG_DB"  core.ContactGroup_Delete                # zero dependency tables
+run_one synonym_ref "$MSG_DB"  core.Report_Traffic_GetCarriers       # dm_sql_referenced_entities can throw
+run_one data_db     "$DATA_DB" core.Balance_Change_InRegion        # per-DB routing
 
 # ---------- 2. idempotency ----------
-DB="$MSG_DB" bash "$SKILL" rt.fnSubAccountRoutingGroup > "$OUT/idem1.json" 2>/dev/null
-DB="$MSG_DB" bash "$SKILL" rt.fnSubAccountRoutingGroup > "$OUT/idem2.json" 2>/dev/null
+DB="$MSG_DB" bash "$SKILL" route.fnSubAccountGroup > "$OUT/idem1.json" 2>/dev/null
+DB="$MSG_DB" bash "$SKILL" route.fnSubAccountGroup > "$OUT/idem2.json" 2>/dev/null
 cmp -s "$OUT/idem1.json" "$OUT/idem2.json" && pass "idempotent: two runs byte-identical" \
                                            || fail "idempotent" "outputs differ"
 
@@ -53,21 +53,21 @@ if DB="$MSG_DB" bash "$SKILL" nope.NotAThing >/dev/null 2>"$OUT/e1.err"; then
   fail "missing object exits non-zero" "exited 0"
 else grep -qi 'not found' "$OUT/e1.err" && pass "missing object -> actionable message" \
                                         || fail "missing object message" "$(head -1 "$OUT/e1.err")"; fi
-DB=NoSuchDb_Zzz bash "$SKILL" rt.fnSubAccountRoutingGroup >/dev/null 2>&1 \
+DB=NoSuchDb_Zzz bash "$SKILL" route.fnSubAccountGroup >/dev/null 2>&1 \
   && fail "bad DB exits non-zero" "exited 0" || pass "bad DB -> non-zero exit"
-DB="$MSG_DB" SA_PASSWORD="WrongPwd!!" timeout 60 bash "$SKILL" rt.fnSubAccountRoutingGroup >/dev/null 2>&1 \
+DB="$MSG_DB" SA_PASSWORD="WrongPwd!!" timeout 60 bash "$SKILL" route.fnSubAccountGroup >/dev/null 2>&1 \
   && fail "bad password exits non-zero" "exited 0" || pass "bad password -> non-zero exit, no hang"
 
 # ---------- 4. injection refusal (name is interpolated into the T-SQL) ----------
 INJ_OK=1
-for BAD in "rt.x' ; SELECT 1 AS pwned; --" "rt.x; DROP TABLE y" "rt.x OR 1=1" "../../etc/passwd" "rt"; do
+for BAD in "route.x' ; SELECT 1 AS pwned; --" "route.x; DROP TABLE y" "route.x OR 1=1" "../../etc/passwd" "route"; do
   OUT_TXT="$(DB="$MSG_DB" bash "$SKILL" "$BAD" 2>&1)"
   if [ $? -eq 0 ] || ! echo "$OUT_TXT" | grep -q 'refusing unsafe'; then
     fail "injection refused: [$BAD]" "not refused"; INJ_OK=0
   fi
 done
 [ $INJ_OK -eq 1 ] && pass "injection: all unsafe object names refused before any SQL runs"
-DB="AppDb_Dev; DROP DATABASE x" bash "$SKILL" rt.fnSubAccountRoutingGroup 2>&1 | grep -q 'refusing unsafe database' \
+DB="AppDb_Dev; DROP DATABASE x" bash "$SKILL" route.fnSubAccountGroup 2>&1 | grep -q 'refusing unsafe database' \
   && pass "injection: unsafe database name refused" || fail "injection: db name" "not refused"
 
 # ---------- 5. production guard on the sampler ----------
@@ -83,7 +83,7 @@ OBJ_CNT="SELECT COUNT(*) FROM sys.objects WHERE is_ms_shipped=0;"
 DDL_MAX="SELECT ISNULL(CONVERT(varchar(30), MAX(modify_date), 126),'none') FROM sys.objects WHERE is_ms_shipped=0;"
 for DBN in "$MSG_DB" "$DATA_DB"; do
   B1=$(q "$DBN" "$USER_ROWS" | tr -dc 0-9); B2=$(q "$DBN" "$OBJ_CNT" | tr -dc 0-9); B3=$(q "$DBN" "$DDL_MAX" | tr -d ' ')
-  for o in rt.fnSubAccountRoutingGroup ms.Survey cp.CmGroup_ContactDelete; do DB="$DBN" bash "$SKILL" "$o" >/dev/null 2>&1; done
+  for o in route.fnSubAccountGroup svc.Survey core.ContactGroup_Delete; do DB="$DBN" bash "$SKILL" "$o" >/dev/null 2>&1; done
   A1=$(q "$DBN" "$USER_ROWS" | tr -dc 0-9); A2=$(q "$DBN" "$OBJ_CNT" | tr -dc 0-9); A3=$(q "$DBN" "$DDL_MAX" | tr -d ' ')
   [ "$B1" = "$A1" ] && [ "$B2" = "$A2" ] && [ "$B3" = "$A3" ] \
     && pass "read-only [$DBN]: user rows/objects/DDL-date all unchanged" \

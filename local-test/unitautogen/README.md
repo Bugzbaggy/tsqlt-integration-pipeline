@@ -52,7 +52,7 @@ So a PR touching one proc reports on that one object; the whole-DB sweep is deli
 > **Per-object generation — each changed object in its own batch.** UnitAutogen rolls back the
 > **whole batch** if any one proc leaves an open transaction, and a connection-recovery from
 > one proc can cascade and silently drop the *rest* of the batch (`Msg 266/3998`; observed:
-> `map`, 265 procs → empty summary, and 8-of-13 / 2-of-3 partial losses even after schema
+> `cfg`, 265 procs → empty summary, and 8-of-13 / 2-of-3 partial losses even after schema
 > scoping). So in object-scoped mode `coverage.sh` runs `GenerateAndCoverDatabase` **once per
 > object** — an install-time patch restricts its enumeration to a caller-supplied `#UA_Only`
 > temp table (one name) — so a bad proc only loses **itself**. The per-object batches are then
@@ -81,9 +81,9 @@ if you don't want a failed diff to fail the build.
 - **51 of 88** procs that produced coverage reached **≥90% line coverage**; avg ≈ 74.5%. (Most
   procs are `NOT_TESTABLE` without the CLR predicate seeder — constraint 3 — so the measurable
   set is ~88, not all 1084.)
-- Ceiling: `map.Account_CompanyId_Update` **100% line / 100% branch**; `tmpl.Template_GetMany`
-  100%; `tmpl.Template_Add` 100% — **independently reproduced**.
-- Weak spot — data-shape-heavy procs: `cp.ReferralCode_Check` 42.9%, because its branches gate on
+- Ceiling: `cfg.Account_CompanyId_Update` **100% line / 100% branch**; `tpl.Template_GetMany`
+  100%; `tpl.Template_Add` 100% — **independently reproduced**.
+- Weak spot — data-shape-heavy procs: `core.ReferralCode_Check` 42.9%, because its branches gate on
   row existence (`IF NOT EXISTS (SELECT … FROM …)`), which needs the predicate seeding this
   platform can't do (constraint 3).
 
@@ -139,7 +139,7 @@ works here because the tools image has `git` and the repo — incl. `.git` — i
 the set explicitly, or force the whole DB, with `UA_SCHEMAS` (see **Scope** above):
 
 ```bash
-UA_SCHEMAS="map tmpl utility" docker compose ... run --rm --build unitautogen   # exactly these
+UA_SCHEMAS="cfg tpl utility" docker compose ... run --rm --build unitautogen   # exactly these
 UA_SCHEMAS=ALL                docker compose ... run --rm --build unitautogen   # whole DB (slow)
 ```
 

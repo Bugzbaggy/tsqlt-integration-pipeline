@@ -5,7 +5,7 @@
 --   sqlcmd -v DbName=AppDb_MSG_Dev  -i bootstrap.sql
 --   sqlcmd -v DbName=AppDb_SIT  -i bootstrap.sql
 --
--- Creates the DB, its 6 filegroups WITH a data file each (rt.PriceListHistory is
+-- Creates the DB, its 6 filegroups WITH a data file each (route.PriceListHistory is
 -- partitioned on PS_PartitionKey — a fileless filegroup fails CREATE TABLE, Msg 622),
 -- and the Database Master Key the 7 self-signed certificates require (else error 15581).
 -- Runs before publish; publish then uses CreateNewDatabase=False. Fresh container per

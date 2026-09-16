@@ -23,7 +23,7 @@ dev server, no schema/data drift.
 ## Publish order & cross-DB variables
 
 - **Order matters:** publish `AppDb_Dev` **before** `AppDb_MSG_Data_Dev`. The data project's views
-  reference synonyms that resolve to `AppDb_Dev` objects (e.g. `cp.Account`), and a view
+  reference synonyms that resolve to `AppDb_Dev` objects (e.g. `core.Account`), and a view
   validates its synonym's target at CREATE time (`Msg 5313`).
 - **Undeployed cross-region targets → a non-existent stub DB** (`AppDb_XDB_Stub`), not `AppDb_Dev`.
   Their synonyms then resolve to nothing and procs create via deferred name resolution. Pointing
@@ -69,7 +69,7 @@ provisioned out-of-band in `bootstrap.sql`, mirroring how dev/prod are actually 
 
 | Concern | Why the dacpac alone fails | Handled by |
 |---|---|---|
-| **Filegroups** | `Storage/FG_0*.sql` add filegroups with **no file**. `rt.PriceListHistory` is `ON PS_PartitionKey`, and a fileless filegroup → `CREATE TABLE` fails (Msg 622). | `bootstrap.sql` adds a file per FG, then publish runs with `CreateNewDatabase=False`. |
+| **Filegroups** | `Storage/FG_0*.sql` add filegroups with **no file**. `route.PriceListHistory` is `ON PS_PartitionKey`, and a fileless filegroup → `CREATE TABLE` fails (Msg 622). | `bootstrap.sql` adds a file per FG, then publish runs with `CreateNewDatabase=False`. |
 | **Database Master Key** | The 7 certificates are self-signed (`CREATE CERTIFICATE WITH SUBJECT`); without a DMK, cert creation fails (error 15581). | `bootstrap.sql` regenerates the DMK fresh with a **throwaway local-dev password** (`L0c@lD3vSQL`) — never a real/prod DMK password. |
 | **Encrypted config** | Certs/keys are **regenerated fresh** here, so prod/dev ciphertext won't decrypt. | Seed **plaintext** and re-encrypt in-container via `EncryptByKey` — see `seed/20_encrypted_config.sql`. |
 
@@ -92,7 +92,7 @@ tests connect as `sa`, so they're pure noise and a source of orphaned-user failu
 | `db-up.ps1` / `db-up.sh` | Local dev: build both dacpacs, stand up the container, provision + publish all DBs, seed, verify |
 | `ci-publish.sh` | CI/Kubernetes: bootstrap→publish→seed→verify against an **already-running** SQL 2022 (no compose/build). For a tools sidecar in the same pod as the mssql container — see below |
 | `AppDb_MSG.local.publish.xml` | Shared sqlpackage options (`CreateNewDatabase=False`, `Ignore*`, `AllowIncompatiblePlatform`); `db-up`/`ci-publish` supply `ExcludeObjectTypes` + SQLCMD vars on the CLI |
-| `seed/00_lookups.sql` | FK-parent lookup rows (DimCompanyEntity, Region, BusinessUnit, Pillar, CustomerSegment, AccountGroup, OmnishieldStatus) the account needs |
+| `seed/00_lookups.sql` | FK-parent lookup rows (DimCompany, Region, BusinessUnit, Tier, CustomerSegment, AccountGroup, OmnishieldStatus) the account needs |
 | `seed/10_accounts.sql` | The `MsgIntTest` account (fixed AccountUid) + one SMS-enabled subaccount |
 | `seed/20_encrypted_config.sql` | Pattern for re-encrypting config in-container; skips cleanly until its scenario parents exist |
 | `seed/30_authapi_key.sql` | Proposed workaround for the symmetric-key blocker (see below): seeds a re-encrypted test API key |
@@ -122,7 +122,7 @@ CLI-`ExcludeObjectTypes` rules as `db-up` (see above) — reuse it; don't re-imp
 
 `WebAppFactory.GetApiKey()` → `smsapi.AuthApi_GetApiKeys` does
 `OPEN SYMMETRIC KEY AuthApi_Key DECRYPTION BY CERTIFICATE AuthApi` then decrypts
-`ms.AuthApi.ApiKey_encrypt`. The `AuthApi` certificate's private key is **not in
+`svc.AuthApi.ApiKey_encrypt`. The `AuthApi` certificate's private key is **not in
 source**, so prod/dev ciphertext cannot be decrypted in a fresh container —
 restoring prod data does not help.
 

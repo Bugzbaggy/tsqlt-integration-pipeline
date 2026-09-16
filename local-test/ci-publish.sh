@@ -81,7 +81,7 @@ for v in AppDb_Analytics AppDb_Connect AppDb_Routing AppDb_Support ZenSphere App
 done
 
 # Order matters: main DB before data DB — AppDb_MSG_data views validate their synonym
-# target (e.g. cp.Account) at CREATE time (Msg 5313), so AppDb_Dev must exist first.
+# target (e.g. core.Account) at CREATE time (Msg 5313), so AppDb_Dev must exist first.
 publish_db "$MSG_DACPAC"  "$MSG_DB"  "bootstrap.sql"      "${MSG_VARS[@]}"
 publish_db "$DATA_DACPAC" "$DATA_DB" "bootstrap.data.sql" "/v:AppDb_MSG=$MSG_DB"
 

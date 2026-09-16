@@ -7,9 +7,9 @@
 //
 // Fixture branch shape (Claude fills branches[]):
 //   { "id": "human label",
-//     "fake": ["rt.RoutingPlanCoverage", ...],          // optional; defaults to fixture.fake
-//     "seed": [ {"table":"rt.RoutingPlanCoverage","row":{"Col":val,...}}, ... ],
-//     "assert": { "actual_expr":"(SELECT RoutingGroupId FROM rt.fnSubAccountRoutingGroup('108','AF'))",
+//     "fake": ["route.PlanCoverage", ...],          // optional; defaults to fixture.fake
+//     "seed": [ {"table":"route.PlanCoverage","row":{"Col":val,...}}, ... ],
+//     "assert": { "actual_expr":"(SELECT RoutingGroupId FROM route.fnSubAccountGroup('108','AF'))",
 //                 "expected": 111,                        // golden value, captured after 1st run
 //                 "message":"..." },
 //     "needs_human_oracle": false }
