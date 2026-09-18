@@ -75,6 +75,12 @@ jobs:
           # jenkins-bot: an internal service-account name, on its own (not just as the 8x8-prefixed
           # form already caught above). #1xxx: an upstream PR number surviving a comment rewrite.
           PAT="$PAT"'|jenkins-bot|#1[0-9]{3}\b'
+          # Real region codes. Examples use region1..regionN and <regionN>-primary; the
+          # alias form, the slash list and the hyphenated set all name live regions outright.
+          PAT="$PAT"'|\b(sg|uk|us|id)-(primary|listener|nlb)\b|sg/id/uk/us|\bID-UK-US\b'
+          # A bare region code used as a region, e.g. "on SG", "For SG that is". Anchored on
+          # the preposition so it cannot fire on the ISO country code in the lookup seed.
+          PAT="$PAT"'|\b(on|in|for|On|In|For) (SG|UK|US|ID)\b'
           if grep -rniE "$PAT" . --exclude-dir=.git --exclude-dir=.github; then
             echo "::error::internal identifier found"; exit 1
           fi
