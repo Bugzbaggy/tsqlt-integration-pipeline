@@ -71,6 +71,7 @@ jobs:
           PAT="$PAT"'|PricingPlanFutureStaging|RoutingPlanCoverage|SupplierConn|vwRoutingTier'
           PAT="$PAT"'|fnClassificationTemplateError|AccountManager|CmGroup|Pillar'
           PAT="$PAT"'|\b(cp|rt|ms|cls|map|tmpl)\.[A-Za-z_]{3,}'
+          PAT="$PAT"'|[Oo]mnishield|[Vv]erif8|[Cc]hatApps|[Jj]itsi'
           if grep -rniE "$PAT" . --exclude-dir=.git --exclude-dir=.github; then
             echo "::error::internal identifier found"; exit 1
           fi

@@ -92,7 +92,7 @@ tests connect as `sa`, so they're pure noise and a source of orphaned-user failu
 | `db-up.ps1` / `db-up.sh` | Local dev: build both dacpacs, stand up the container, provision + publish all DBs, seed, verify |
 | `ci-publish.sh` | CI/Kubernetes: bootstrap→publish→seed→verify against an **already-running** SQL 2022 (no compose/build). For a tools sidecar in the same pod as the mssql container — see below |
 | `AppDb_MSG.local.publish.xml` | Shared sqlpackage options (`CreateNewDatabase=False`, `Ignore*`, `AllowIncompatiblePlatform`); `db-up`/`ci-publish` supply `ExcludeObjectTypes` + SQLCMD vars on the CLI |
-| `seed/00_lookups.sql` | FK-parent lookup rows (DimCompany, Region, BusinessUnit, Tier, CustomerSegment, AccountGroup, OmnishieldStatus) the account needs |
+| `seed/00_lookups.sql` | FK-parent lookup rows (DimCompany, Region, BusinessUnit, Tier, CustomerSegment, AccountGroup, ProtectionStatus) the account needs |
 | `seed/10_accounts.sql` | The `MsgIntTest` account (fixed AccountUid) + one SMS-enabled subaccount |
 | `seed/20_encrypted_config.sql` | Pattern for re-encrypting config in-container; skips cleanly until its scenario parents exist |
 | `seed/30_authapi_key.sql` | Proposed workaround for the symmetric-key blocker (see below): seeds a re-encrypted test API key |

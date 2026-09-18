@@ -3,7 +3,7 @@
 --
 -- core.Account has NOT-NULL foreign keys (each defaulting to 0 / 'WSG') to these
 -- lookups, so the parent rows must exist before the account inserts. svc.SubAccount
--- additionally needs omnishield.OmnishieldStatus. All lookups here are IDENTITY(0,1)
+-- additionally needs protection.ProtectionStatus. All lookups here are IDENTITY(0,1)
 -- (except DimCompany/Region), so id 0 is inserted with IDENTITY_INSERT.
 -- Idempotent: safe to re-run.
 --
@@ -64,12 +64,12 @@ BEGIN
 END
 GO
 
--- SubAccount.OmnishieldStatusId defaults to 0.
-IF NOT EXISTS (SELECT 1 FROM omnishield.OmnishieldStatus WHERE OmnishieldStatusId = 0)
+-- SubAccount.ProtectionStatusId defaults to 0.
+IF NOT EXISTS (SELECT 1 FROM protection.ProtectionStatus WHERE ProtectionStatusId = 0)
 BEGIN
-    SET IDENTITY_INSERT omnishield.OmnishieldStatus ON;
-    INSERT omnishield.OmnishieldStatus (OmnishieldStatusId, OmnishieldStatus) VALUES (0, 'None');
-    SET IDENTITY_INSERT omnishield.OmnishieldStatus OFF;
+    SET IDENTITY_INSERT protection.ProtectionStatus ON;
+    INSERT protection.ProtectionStatus (ProtectionStatusId, ProtectionStatus) VALUES (0, 'None');
+    SET IDENTITY_INSERT protection.ProtectionStatus OFF;
 END
 GO
 

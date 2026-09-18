@@ -28,7 +28,7 @@ IF NOT EXISTS (SELECT 1 FROM core.Account WHERE AccountId = 'MsgIntTest')
 -- One SMS-enabled subaccount under the account.
 -- SubAccountUid is NOT an identity column, so supply it explicitly.
 IF NOT EXISTS (SELECT 1 FROM svc.SubAccount WHERE SubAccountId = 'MsgIntTest_1')
-    INSERT svc.SubAccount (SubAccountUid, SubAccountId, AccountUid, Active, Product_SMS, OmnishieldStatusId)
+    INSERT svc.SubAccount (SubAccountUid, SubAccountId, AccountUid, Active, Product_SMS, ProtectionStatusId)
     VALUES (1, 'MsgIntTest_1', @AccountUid, 1, 1, 0);
 GO
 
