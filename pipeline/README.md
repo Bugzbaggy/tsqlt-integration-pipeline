@@ -19,10 +19,10 @@ Everything runs in containers, so a **Linux Jenkins agent needs only Docker** �
 | File | Role |
 |---|---|
 | `Jenkinsfile` | the pipeline (Linux agent) |
-| [`local-test/docker-compose.yml`](../../local-test/docker-compose.yml) | the SQL Server 2022 service |
-| [`local-test/docker-compose.ci.yml`](../../local-test/docker-compose.ci.yml) | CI overlay: the `tools` container |
-| [`local-test/tools.Dockerfile`](../../local-test/tools.Dockerfile) | tools image — .NET 8 SDK + `sqlpackage` + `sqlcmd` |
-| [`local-test/ci-publish.sh`](../../local-test/ci-publish.sh) | bootstrap + publish + seed + verify (runs inside the tools container) |
+| [`local-test/docker-compose.yml`](../local-test/docker-compose.yml) | the SQL Server 2022 service |
+| [`local-test/docker-compose.ci.yml`](../local-test/docker-compose.ci.yml) | CI overlay: the `tools` container |
+| [`local-test/tools.Dockerfile`](../local-test/tools.Dockerfile) | tools image — .NET 8 SDK + `sqlpackage` + `sqlcmd` |
+| [`local-test/ci-publish.sh`](../local-test/ci-publish.sh) | bootstrap + publish + seed + verify (runs inside the tools container) |
 
 Run it by hand (any Linux/macOS box with Docker):
 
@@ -33,7 +33,7 @@ docker compose -f local-test/docker-compose.yml -f local-test/docker-compose.ci.
 docker compose -f local-test/docker-compose.yml -f local-test/docker-compose.ci.yml down -v
 ```
 
-> Local Windows dev uses [`local-test/db-up.ps1`](../../local-test/db-up.ps1) instead (same
+> Local Windows dev uses [`local-test/db-up.ps1`](../local-test/db-up.ps1) instead (same
 > lifecycle, native PowerShell). CI is Linux and uses the container flow above.
 
 ## Agent requirements
@@ -73,15 +73,15 @@ only its class). None can block a merge — only publish + `VERIFY OK` gates.
 
 | Stage | What it checks | Runner / source |
 |---|---|---|
-| `📐 Contract tests` | your changed proc/fn's **interface** (parameters + result-set columns) is unchanged, from catalog metadata (no execution) | [`run-contract-tests.sh`](../../local-test/tsqlt/run-contract-tests.sh) over [`tests/contract/`](../../tests/contract) |
-| `🔬 Characterization tests` | a changed **deterministic scalar function** still returns the same **output** for a fixed input | [`run-characterization-tests.sh`](../../local-test/tsqlt/run-characterization-tests.sh) over [`tests/characterization/`](../../tests/characterization) |
-| `🧮 Auto-generate missing baselines` | generates a contract/characterization baseline for a changed object that has **none yet** (report-only; never overwrites an existing baseline) | [`autogen-missing-baselines.sh`](../../local-test/tsqlt/autogen-missing-baselines.sh) |
-| `✅ tSQLt regression tests` | hand-written **curated** tSQLt tests with real assertions | [`run-curated-tests.sh`](../../local-test/tsqlt/run-curated-tests.sh) over `tests/curated/` |
+| `📐 Contract tests` | your changed proc/fn's **interface** (parameters + result-set columns) is unchanged, from catalog metadata (no execution) | [`run-contract-tests.sh`](../local-test/tsqlt/run-contract-tests.sh) over `tests/contract/` |
+| `🔬 Characterization tests` | a changed **deterministic scalar function** still returns the same **output** for a fixed input | [`run-characterization-tests.sh`](../local-test/tsqlt/run-characterization-tests.sh) over `tests/characterization/` |
+| `🧮 Auto-generate missing baselines` | generates a contract/characterization baseline for a changed object that has **none yet** (report-only; never overwrites an existing baseline) | [`autogen-missing-baselines.sh`](../local-test/tsqlt/autogen-missing-baselines.sh) |
+| `✅ tSQLt regression tests` | hand-written **curated** tSQLt tests with real assertions | [`run-curated-tests.sh`](../local-test/tsqlt/run-curated-tests.sh) over `tests/curated/` |
 
 Contract + characterization baselines are **auto-generated, no hand-written assertions** — an
 intended change makes a test RED and you regenerate the baseline (a reviewable diff).
 Characterization only ever covers **deterministic scalar functions**
-([`char-eligible.where.sql`](../../local-test/tsqlt/char-eligible.where.sql) is the single
+([`char-eligible.where.sql`](../local-test/tsqlt/char-eligible.where.sql) is the single
 definition of that scope, shared by the generator and the runner); a changed stored procedure
 is out of scope, not a gap.
 
@@ -94,18 +94,18 @@ leaves for a human. The `AUTO_COMMIT_BASELINES` build parameter turns on committ
 the generated file to the PR branch instead, with its own guardrails (see the Jenkinsfile's
 `autoCommitBaselines()`).
 
-Full detail: [`local-test/README.md`](../../local-test/README.md) ("Contract, characterization & curated tests").
+Full detail: [`local-test/README.md`](../local-test/README.md) ("Contract, characterization & curated tests").
 
 ## Coverage (report-only)
 
 Between publish and the E2E stage, the `📊 Coverage (UnitAutogen, report-only)` stage
 auto-generates tSQLt tests for the branch's stored procedures and measures **line coverage**,
 publishing **Cobertura + JUnit** per schema (`artifacts/*.xml`). It reuses the tools image via
-[`local-test/docker-compose.unitautogen.yml`](../../local-test/docker-compose.unitautogen.yml)
-and runs [`local-test/unitautogen/coverage.sh`](../../local-test/unitautogen/coverage.sh).
+[`local-test/docker-compose.unitautogen.yml`](../local-test/docker-compose.unitautogen.yml)
+and runs [`local-test/unitautogen/coverage.sh`](../local-test/unitautogen/coverage.sh).
 
 **Report-only / non-blocking:** wrapped in `catchError(buildResult: 'SUCCESS')` with a 20-min
 timeout — a fault or timeout marks the stage `UNSTABLE`, never failing the build. Needs outbound
 access to `codeload.github.com` (the pinned UnitAutogen fetch). On SQL Server for Linux most
 procs reach 90–100% line coverage; branch coverage is best-effort. Full details, constraints,
-and the Kubernetes (`mssql-2022`) variant: [`local-test/unitautogen/README.md`](../../local-test/unitautogen/README.md).
+and the Kubernetes (`mssql-2022`) variant: [`local-test/unitautogen/README.md`](../local-test/unitautogen/README.md).

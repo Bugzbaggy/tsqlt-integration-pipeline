@@ -11,7 +11,7 @@
 # The non-zero exit is a real signal (use it as a hard gate locally / in pre-merge if you
 # want). In the Jenkins pipeline it is currently wired REPORT-ONLY (catchError): a failure
 # surfaces in the PR comment and marks the stage unstable but does not fail the build. Flip
-# it to blocking by removing that catchError in pipelines/integration-test/Jenkinsfile.
+# it to blocking by removing that catchError in pipeline/Jenkinsfile.
 #
 # Runs in the tools/mssql image (needs sqlcmd) against the same-pod sidecar over localhost.
 # Config via environment (same names as ci-publish.sh / coverage.sh):

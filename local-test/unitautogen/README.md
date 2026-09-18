@@ -3,7 +3,7 @@
 Auto-generates [tSQLt](https://tsqlt.org) tests for the branch's stored procedures and
 measures **line coverage**, emitting Cobertura + JUnit per schema. Runs as the
 `📊 Coverage (UnitAutogen, report-only)` stage of the integration pipeline
-([`pipelines/integration-test/Jenkinsfile`](../../pipelines/integration-test/Jenkinsfile)).
+([`pipeline/Jenkinsfile`](../../pipeline/Jenkinsfile)).
 
 > **Report-only, non-blocking.** [`coverage.sh`](coverage.sh) always exits 0, and the
 > Jenkins stage is wrapped in `catchError(buildResult: 'SUCCESS')` with its own 20-min
