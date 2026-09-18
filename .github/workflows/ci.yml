@@ -72,6 +72,9 @@ jobs:
           PAT="$PAT"'|fnClassificationTemplateError|AccountManager|CmGroup|Pillar'
           PAT="$PAT"'|\b(cp|rt|ms|cls|map|tmpl)\.[A-Za-z_]{3,}'
           PAT="$PAT"'|[Oo]mnishield|[Vv]erif8|[Cc]hatApps|[Jj]itsi'
+          # jenkins-bot: an internal service-account name, on its own (not just as the 8x8-prefixed
+          # form already caught above). #1xxx: an upstream PR number surviving a comment rewrite.
+          PAT="$PAT"'|jenkins-bot|#1[0-9]{3}\b'
           if grep -rniE "$PAT" . --exclude-dir=.git --exclude-dir=.github; then
             echo "::error::internal identifier found"; exit 1
           fi
