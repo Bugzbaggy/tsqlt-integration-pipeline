@@ -72,7 +72,9 @@ RS_EXPR="(SELECT ISNULL(STRING_AGG(
 sig_bulk="${SIG_EXPR//%OID%/o.object_id}"
 rs_bulk="${RS_EXPR//%OID%/o.object_id}"
 
-sql() { "$SQLCMD" -S "$SERVER,$PORT" -U sa -P "$SA_PASSWORD" $SQLCMD_ENC -I -h -1 -y 8000 -d "$DB" -Q "SET NOCOUNT ON; $1" 2>/dev/null; }
+# See gen-characterization-tests.sh: the </dev/null stops sqlcmd rewinding an enclosing
+# while-read loop stdin into an infinite loop.
+sql() { "$SQLCMD" -S "$SERVER,$PORT" -U sa -P "$SA_PASSWORD" $SQLCMD_ENC -I -h -1 -y 8000 -d "$DB" -Q "SET NOCOUNT ON; $1" 2>/dev/null </dev/null; }
 
 schema_pred=""
 [ -n "$SCHEMA_FILTER" ] && schema_pred="AND s.name = '$(printf %s "$SCHEMA_FILTER" | sed "s/'/''/g")'"
@@ -92,7 +94,7 @@ ORDER BY s.name, o.name;")"
 [ -n "$rows" ] || { echo "  no objects found (schema filter? empty DB?)"; exit 1; }
 
 emitted=0; sig_only=0; with_rs=0; trunc=0; schemas=0; prev_sch=""
-while IFS= read -r line; do
+while IFS= read -r line <&9; do
   [ -z "$line" ] && continue
   sch="${line%%~|~*}";        rest="${line#*~|~}"
   obj="${rest%%~|~*}";        rest="${rest#*~|~}"
@@ -150,6 +152,6 @@ while IFS= read -r line; do
     fi
   } >> "$outfile"
   emitted=$((emitted+1))
-done <<< "$rows"
+done 9<<< "$rows"
 
 echo "Done: $emitted objects in $schemas schema file(s) -> $OUT_ROOT/  (with result-set contract: $with_rs, signature-only: $sig_only, skipped-truncated: $trunc)"
