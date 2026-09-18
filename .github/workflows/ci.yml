@@ -70,7 +70,7 @@ jobs:
           PAT="$PAT"'|AccountWallet|RoutingManager|SupplierList|SmsTraffic|DimCompanyEntity'
           PAT="$PAT"'|PricingPlanFutureStaging|RoutingPlanCoverage|SupplierConn|vwRoutingTier'
           PAT="$PAT"'|fnClassificationTemplateError|AccountManager|CmGroup|Pillar'
-          PAT="$PAT"'|\b(cp|rt|ms|cls|map|tmpl)\.[A-Za-z_]{3,}'
+          PAT="$PAT"'|\b(cp|rt|ms|ipm|cls|map|tmpl)\.[A-Za-z_]{3,}'
           PAT="$PAT"'|[Oo]mnishield|[Vv]erif8|[Cc]hatApps|[Jj]itsi'
           # jenkins-bot: an internal service-account name, on its own (not just as the 8x8-prefixed
           # form already caught above). #1xxx: an upstream PR number surviving a comment rewrite.
