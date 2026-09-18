@@ -86,8 +86,12 @@ jobs:
           # "fix this for us" / "tell us" — a false positive that would eventually be
           # silenced by someone widening the pattern, which is how gates rot.
           PAT_CS='\b(on|in|for|On|In|For) (SG|UK|US|ID)\b'
-          hits=$(grep -rniE "$PAT" . --exclude-dir=.git --exclude-dir=.github)
-          hits_cs=$(grep -rnE "$PAT_CS" . --exclude-dir=.git --exclude-dir=.github)
+          # `|| true` is load-bearing: the step runs under `bash -e`, and grep exits 1
+          # when it finds NOTHING. Without it a clean tree kills the step at the first
+          # assignment, with no output. The previous `if grep ...; then` form hid this
+          # because `if` consumes the non-zero status.
+          hits=$(grep -rniE "$PAT" . --exclude-dir=.git --exclude-dir=.github || true)
+          hits_cs=$(grep -rnE "$PAT_CS" . --exclude-dir=.git --exclude-dir=.github || true)
           if [ -n "$hits" ] || [ -n "$hits_cs" ]; then
             [ -n "$hits" ] && echo "$hits"
             [ -n "$hits_cs" ] && echo "$hits_cs"
