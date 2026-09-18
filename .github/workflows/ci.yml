@@ -80,8 +80,17 @@ jobs:
           PAT="$PAT"'|\b(sg|uk|us|id)-(primary|listener|nlb)\b|sg/id/uk/us|\bID-UK-US\b'
           # A bare region code used as a region, e.g. "on SG", "For SG that is". Anchored on
           # the preposition so it cannot fire on the ISO country code in the lookup seed.
-          PAT="$PAT"'|\b(on|in|for|On|In|For) (SG|UK|US|ID)\b'
-          if grep -rniE "$PAT" . --exclude-dir=.git --exclude-dir=.github; then
+          #
+          # This one is checked case-SENSITIVELY, in its own pass. Region codes are always
+          # written upper-case, and under -i the pattern also matches the ordinary English
+          # "fix this for us" / "tell us" — a false positive that would eventually be
+          # silenced by someone widening the pattern, which is how gates rot.
+          PAT_CS='\b(on|in|for|On|In|For) (SG|UK|US|ID)\b'
+          hits=$(grep -rniE "$PAT" . --exclude-dir=.git --exclude-dir=.github)
+          hits_cs=$(grep -rnE "$PAT_CS" . --exclude-dir=.git --exclude-dir=.github)
+          if [ -n "$hits" ] || [ -n "$hits_cs" ]; then
+            [ -n "$hits" ] && echo "$hits"
+            [ -n "$hits_cs" ] && echo "$hits_cs"
             echo "::error::internal identifier found"; exit 1
           fi
           echo 'Leak scan clean.'
