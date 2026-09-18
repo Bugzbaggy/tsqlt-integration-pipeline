@@ -75,11 +75,26 @@ only its class). None can block a merge — only publish + `VERIFY OK` gates.
 |---|---|---|
 | `📐 Contract tests` | your changed proc/fn's **interface** (parameters + result-set columns) is unchanged, from catalog metadata (no execution) | [`run-contract-tests.sh`](../../local-test/tsqlt/run-contract-tests.sh) over [`tests/contract/`](../../tests/contract) |
 | `🔬 Characterization tests` | a changed **deterministic scalar function** still returns the same **output** for a fixed input | [`run-characterization-tests.sh`](../../local-test/tsqlt/run-characterization-tests.sh) over [`tests/characterization/`](../../tests/characterization) |
+| `🧮 Auto-generate missing baselines` | generates a contract/characterization baseline for a changed object that has **none yet** (report-only; never overwrites an existing baseline) | [`autogen-missing-baselines.sh`](../../local-test/tsqlt/autogen-missing-baselines.sh) |
 | `✅ tSQLt regression tests` | hand-written **curated** tSQLt tests with real assertions | [`run-curated-tests.sh`](../../local-test/tsqlt/run-curated-tests.sh) over `tests/curated/` |
 
 Contract + characterization baselines are **auto-generated, no hand-written assertions** — an
-intended change makes a test RED and you regenerate the baseline (a reviewable diff). Full
-detail: [`tests/README.md`](../../tests/README.md).
+intended change makes a test RED and you regenerate the baseline (a reviewable diff).
+Characterization only ever covers **deterministic scalar functions**
+([`char-eligible.where.sql`](../../local-test/tsqlt/char-eligible.where.sql) is the single
+definition of that scope, shared by the generator and the runner); a changed stored procedure
+is out of scope, not a gap.
+
+A changed object with **no baseline at all yet** (new, or never generated) used to just report
+"nothing ran". The `🧮 Auto-generate missing baselines` stage now generates it for you and
+attaches it to the build instead — **nothing is pushed to your branch by default**, and the PR
+comment says so. It keeps the result only when regenerating the schema file was purely additive
+(zero deleted lines); any deletion means an *existing* baseline changed, which it reverts and
+leaves for a human. The `AUTO_COMMIT_BASELINES` build parameter turns on committing + pushing
+the generated file to the PR branch instead, with its own guardrails (see the Jenkinsfile's
+`autoCommitBaselines()`).
+
+Full detail: [`local-test/README.md`](../../local-test/README.md) ("Contract, characterization & curated tests").
 
 ## Coverage (report-only)
 
