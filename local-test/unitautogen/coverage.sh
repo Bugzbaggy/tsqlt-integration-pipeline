@@ -4,7 +4,7 @@
 # against the ALREADY-PROVISIONED AppDb_MSG test databases, and emit Cobertura +
 # JUnit + a compact per-object summary. Runs inside the "tools"/mssql image (has
 # sqlcmd); reaches sqlservr over localhost. Wired in as the integration
-# pipeline's coverage stage (see pipelines/integration-test/Jenkinsfile).
+# pipeline's coverage stage (see pipeline/Jenkinsfile).
 #
 # REPORT-ONLY BY DESIGN: this script always exits 0. It publishes coverage/test
 # artifacts as an informational signal; it never fails the build.

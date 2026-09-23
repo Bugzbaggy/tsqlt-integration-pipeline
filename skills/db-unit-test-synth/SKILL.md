@@ -34,7 +34,7 @@ plus a short list of objects whose behaviour encodes a business rule (money, rou
 - **`schema`** (e.g. `route`) — every SP/function/view in that schema, both DBs.
 - **`.`** — full backfill across `AppDb_MSG` + `AppDb_MSG_data` (large; work schema-by-schema).
 
-AppDb_MSG objects live in DB `AppCatalog` on SG / `AppDb` in ID-UK-US / `AppDb_Dev` in CI.
+AppDb_MSG objects live in DB `AppCatalog` in the primary region / `AppDb` in the secondary regions / `AppDb_Dev` in CI.
 AppDb_MSG_data objects live in DB `AppDb_Data` (`AppDb_MSG_Data_Dev` in CI). Test each object in the DB it lives in.
 
 ## Workflow (per object)
@@ -57,9 +57,9 @@ Only to make seeds *realistic* and to learn the true set of values a branch pred
 (e.g. the actual `TrafficCategory` / `Status` codes). This is the only step that may touch production, and
 it is fenced hard:
 
-- **Target the READ-ONLY SECONDARY only.** For SG that is **`region1-node1`** (verified: `AppCatalog` and
+- **Target the READ-ONLY SECONDARY only.** In the primary region that is **`region1-node1`** (verified: `AppCatalog` and
   `AppDb_Data` are `Updateability = READ_ONLY` there — writes are physically impossible). Never the
-  `sg-primary` / `region1-node2` primary.
+  `region1-primary` / `region1-node2` primary.
 - Run via the MCP `mcp__appdb-sql__execute_query` with `instance_name: "region1-node1"`. The sampler
   `scripts/sample-domains.sql` self-guards: it `RAISERROR`s and returns nothing unless
   `DATABASEPROPERTYEX(DB_NAME(),'Updateability') = 'READ_ONLY'`.

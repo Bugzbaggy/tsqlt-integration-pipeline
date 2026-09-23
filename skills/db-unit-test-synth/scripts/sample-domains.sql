@@ -3,7 +3,7 @@
 --
 -- SAFE BY CONSTRUCTION:
 --   * Self-guards: does nothing unless the current DB is READ_ONLY (a secondary replica).
---     On SG that is region1-node1. Pointed at a primary it RAISERRORs and returns no rows.
+--     In the primary region that is region1-node1. Pointed at a primary it RAISERRORs and returns no rows.
 --   * READ UNCOMMITTED + LOCK_TIMEOUT 3000  -> never blocks production.
 --   * Only columns whose name passes config/sensitive.deny AND COUNT(DISTINCT) <= @MaxCardinality.
 --   * Returns DISTINCT VALUE LISTS only — never a full/joined row, so no record is reconstructed.

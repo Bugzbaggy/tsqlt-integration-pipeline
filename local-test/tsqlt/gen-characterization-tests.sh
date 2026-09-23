@@ -28,6 +28,7 @@ SQLCMD_ENC="${SQLCMD_ENC:--C}"
 OUT_ROOT="${OUT_ROOT:-tests/characterization}"
 
 DB="${1:?usage: gen-characterization-tests.sh <DB> [--schema <name>] [--out <dir>]}"; shift
+HERE="$(cd "$(dirname "$0")" && pwd)"
 SCHEMA_FILTER=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -42,7 +43,11 @@ SQLCMD="$(command -v sqlcmd || true)"
 [ -z "$SQLCMD" ] && [ -x /opt/mssql-tools18/bin/sqlcmd ] && SQLCMD=/opt/mssql-tools18/bin/sqlcmd
 [ -z "$SQLCMD" ] && [ -x /opt/mssql-tools/bin/sqlcmd ]   && SQLCMD=/opt/mssql-tools/bin/sqlcmd
 [ -n "$SQLCMD" ] || { echo "gen-characterization-tests: sqlcmd not found" >&2; exit 2; }
-q() { "$SQLCMD" -S "$SERVER,$PORT" -U sa -P "$SA_PASSWORD" $SQLCMD_ENC -I -h -1 -y 8000 -d "$DB" -Q "SET NOCOUNT ON; $1" 2>/dev/null | sed -e 's/[[:space:]]*$//'; }
+# NOTE the </dev/null: sqlcmd inherits this shell stdin, and when the caller is a
+# `while read ... done <<< "$list"` loop (a seekable temp file), it REWINDS that file - the loop
+# then restarts at line 1 forever, appending the same test to the output file until the build
+# times out. Observed live. The outer loops also read on FD 9 for the same reason.
+q() { "$SQLCMD" -S "$SERVER,$PORT" -U sa -P "$SA_PASSWORD" $SQLCMD_ENC -I -h -1 -y 8000 -d "$DB" -Q "SET NOCOUNT ON; $1" 2>/dev/null </dev/null | sed -e 's/[[:space:]]*$//'; }
 
 # A fixed, type-appropriate literal per parameter (positional, ordered) — the representative
 # input tuple. Same expression is used to build the call at gen time and inside the test, so
@@ -63,7 +68,7 @@ INPUT_EXPR="(SELECT STRING_AGG(CASE
    FROM sys.parameters p JOIN sys.types t ON t.user_type_id=p.user_type_id
    WHERE p.object_id=OBJECT_ID(@FQ) AND p.parameter_id>0)"
 
-# Slice 2b: type-matched column value for seeding a faked dependency table — the SAME type->value
+# Slice 2b: type-matched column value for seeding a faked dependency table - the SAME type->value
 # map as INPUT_EXPR, so a `WHERE col = @param` filter matches (proven on core.fnGetAccountUid). Bit
 # seeds 0 to satisfy the common `Deleted = 0` soft-delete filter.
 COLVAL="CASE WHEN t.name IN ('bigint','int','smallint','tinyint') THEN '1'
@@ -82,35 +87,38 @@ COLVAL="CASE WHEN t.name IN ('bigint','int','smallint','tinyint') THEN '1'
 schema_pred=""
 [ -n "$SCHEMA_FILTER" ] && schema_pred="AND s.name = '$(printf %s "$SCHEMA_FILTER" | sed "s/'/''/g")'"
 
-# Determinism gate: a scalar function whose output is a pure function of its inputs — no
-# table/view reads (data could change) and no non-deterministic built-ins. NOTE: we do NOT
-# use OBJECTPROPERTY(id,'IsDeterministic') — SQL Server only sets it for WITH SCHEMABINDING
-# functions, so it wrongly excludes the many pure-but-not-schemabound utility functions.
+# Determinism gate: a scalar function whose output is a pure function of its inputs - no
+# table/view reads (data could change) and no non-deterministic built-ins. The predicate itself
+# lives in char-eligible.where.sql because run-characterization-tests.sh has to ask the SAME
+# question (is this object eligible for a baseline at all?) before it may report an object as
+# "no baseline yet" - two copies of it would drift and turn every changed stored procedure into
+# a permanent warning.
+ELIG_WHERE="$(cat "$HERE/char-eligible.where.sql")"
+[ -n "$ELIG_WHERE" ] || { echo "ERROR: char-eligible.where.sql missing or empty next to this script." >&2; exit 2; }
 echo "==> [$DB] finding deterministic scalar functions ${SCHEMA_FILTER:+(schema=$SCHEMA_FILTER) }..."
-fns="$(q "SELECT (s.name COLLATE DATABASE_DEFAULT)+'~|~'+(o.name COLLATE DATABASE_DEFAULT)
-         FROM sys.objects o JOIN sys.schemas s ON s.schema_id=o.schema_id
-         CROSS APPLY (SELECT def = OBJECT_DEFINITION(o.object_id)) d2
-         WHERE o.type='FN' AND o.is_ms_shipped=0
-           AND s.name NOT LIKE 'test[_]%' AND s.name<>'tSQLt' $schema_pred
-           -- Every dependency must be a same-DB TABLE (type U) so tSQLt.FakeTable can isolate
-           -- the function completely. 0 U-deps => pure function (slice 2a); >=1 U-dep => seeded
-           -- (slice 2b). A dependency on a view/proc/other-function or a cross-DB object is out
-           -- of scope (its reads can't be faked deterministically) and excludes the function.
-           AND NOT EXISTS (SELECT 1 FROM sys.sql_expression_dependencies d
-                           LEFT JOIN sys.objects ro ON ro.object_id=d.referenced_id
-                           WHERE d.referencing_id=o.object_id
-                             AND (d.referenced_database_name IS NOT NULL OR ro.object_id IS NULL OR ro.type<>'U'))
-           -- no non-deterministic built-ins
-           AND d2.def NOT LIKE '%GETDATE%'      AND d2.def NOT LIKE '%NEWID%'
-           AND d2.def NOT LIKE '%RAND(%'        AND d2.def NOT LIKE '%SYSDATETIME%'
-           AND d2.def NOT LIKE '%SYSUTCDATETIME%' AND d2.def NOT LIKE '%GETUTCDATE%'
-           AND d2.def NOT LIKE '%CURRENT_TIMESTAMP%' AND d2.def NOT LIKE '%NEWSEQUENTIALID%'
-         ORDER BY s.name, o.name;")"
+# Through a FILE, not -Q. sqlcmd mis-parses a multi-line -Q batch that carries SQL comments, and
+# q() swallows stderr, so the failure would surface as the far more plausible-looking "no
+# deterministic scalar functions found" rather than as an error.
+elig_q="$(mktemp)"
+cat > "$elig_q" <<SQL
+SET NOCOUNT ON;
+SELECT (s.name COLLATE DATABASE_DEFAULT)+'~|~'+(o.name COLLATE DATABASE_DEFAULT)
+FROM sys.objects o JOIN sys.schemas s ON s.schema_id=o.schema_id
+CROSS APPLY (SELECT def = OBJECT_DEFINITION(o.object_id)) d2
+WHERE (
+$ELIG_WHERE
+) $schema_pred
+ORDER BY s.name, o.name;
+SQL
+fns="$("$SQLCMD" -S "$SERVER,$PORT" -U sa -P "$SA_PASSWORD" $SQLCMD_ENC -I -b -h -1 -y 8000 -d "$DB" -i "$elig_q" | sed -e 's/[[:space:]]*$//')"
+gen_rc=$?   # pipefail is on (see set -o above), so this is sqlcmd, not sed
+rm -f "$elig_q"
+[ "$gen_rc" -eq 0 ] || { echo "ERROR: [$DB] eligibility query failed (sqlcmd exit $gen_rc)." >&2; exit 2; }
 
 [ -n "$fns" ] || { echo "  no deterministic scalar functions found."; exit 0; }
 
 emitted=0; skipped=0; seeded=0; schemas=0; prev_sch=""
-while IFS= read -r line; do
+while IFS= read -r line <&9; do
   [ -z "$line" ] && continue
   sch="${line%%~|~*}"; obj="${line##*~|~}"
   fqlit="'$sch.$obj'"
@@ -165,6 +173,15 @@ ROLLBACK;")"
   if [ -n "$deps" ] && [ "$captured" = "<<NULL>>" ]; then
     echo "  ~ $sch.$obj: seeded call returned NULL - skipped (generic seed missed; curated)"; skipped=$((skipped+1)); continue
   fi
+  # A BATCH-level error (a compile error - e.g. a generated seed that does not compile) is not
+  # caught by the TRY/CATCH above: sqlcmd prints the message on stdout, so it would be embedded
+  # as the golden value and the test would pass for ever while the function is unreachable.
+  # Observed live on msg.fnMessageSegments. Refuse it the same way as <<ERR>>.
+  case "$captured" in
+    "Msg "[0-9]*", Level "*|*"Incorrect syntax near"*)
+      echo "  ~ $sch.$obj: call raised a batch error - skipped (would have pinned the error text as the baseline)"
+      skipped=$((skipped+1)); continue ;;
+  esac
   esc="${captured//\'/\'\'}"
   cls="test_char_${sch}_${obj}"
   # One file per SCHEMA (fns are ORDER BY schema): fresh header on schema change, then append.
@@ -198,6 +215,6 @@ ROLLBACK;")"
   } >> "$outfile"
   if [ -n "$deps" ]; then echo "  + $sch.$obj (2b, seeded) = $captured"; seeded=$((seeded+1)); else echo "  + $sch.$obj = $captured"; fi
   emitted=$((emitted+1))
-done <<< "$fns"
+done 9<<< "$fns"
 
 echo "Done: $emitted characterization test(s) in $schemas schema file(s) -> $OUT_ROOT/  ($seeded seeded/2b, skipped $skipped)"

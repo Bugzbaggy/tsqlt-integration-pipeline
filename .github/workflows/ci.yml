@@ -70,9 +70,31 @@ jobs:
           PAT="$PAT"'|AccountWallet|RoutingManager|SupplierList|SmsTraffic|DimCompanyEntity'
           PAT="$PAT"'|PricingPlanFutureStaging|RoutingPlanCoverage|SupplierConn|vwRoutingTier'
           PAT="$PAT"'|fnClassificationTemplateError|AccountManager|CmGroup|Pillar'
-          PAT="$PAT"'|\b(cp|rt|ms|cls|map|tmpl)\.[A-Za-z_]{3,}'
+          PAT="$PAT"'|\b(cp|rt|ms|ipm|cls|map|tmpl)\.[A-Za-z_]{3,}'
           PAT="$PAT"'|[Oo]mnishield|[Vv]erif8|[Cc]hatApps|[Jj]itsi'
-          if grep -rniE "$PAT" . --exclude-dir=.git --exclude-dir=.github; then
+          # jenkins-bot: an internal service-account name, on its own (not just as the 8x8-prefixed
+          # form already caught above). #1xxx: an upstream PR number surviving a comment rewrite.
+          PAT="$PAT"'|jenkins-bot|#1[0-9]{3}\b'
+          # Real region codes. Examples use region1..regionN and <regionN>-primary; the
+          # alias form, the slash list and the hyphenated set all name live regions outright.
+          PAT="$PAT"'|\b(sg|uk|us|id)-(primary|listener|nlb)\b|sg/id/uk/us|\bID-UK-US\b'
+          # A bare region code used as a region, e.g. "on SG", "For SG that is". Anchored on
+          # the preposition so it cannot fire on the ISO country code in the lookup seed.
+          #
+          # This one is checked case-SENSITIVELY, in its own pass. Region codes are always
+          # written upper-case, and under -i the pattern also matches the ordinary English
+          # "fix this for us" / "tell us" — a false positive that would eventually be
+          # silenced by someone widening the pattern, which is how gates rot.
+          PAT_CS='\b(on|in|for|On|In|For) (SG|UK|US|ID)\b'
+          # `|| true` is load-bearing: the step runs under `bash -e`, and grep exits 1
+          # when it finds NOTHING. Without it a clean tree kills the step at the first
+          # assignment, with no output. The previous `if grep ...; then` form hid this
+          # because `if` consumes the non-zero status.
+          hits=$(grep -rniE "$PAT" . --exclude-dir=.git --exclude-dir=.github || true)
+          hits_cs=$(grep -rnE "$PAT_CS" . --exclude-dir=.git --exclude-dir=.github || true)
+          if [ -n "$hits" ] || [ -n "$hits_cs" ]; then
+            [ -n "$hits" ] && echo "$hits"
+            [ -n "$hits_cs" ] && echo "$hits_cs"
             echo "::error::internal identifier found"; exit 1
           fi
           echo 'Leak scan clean.'

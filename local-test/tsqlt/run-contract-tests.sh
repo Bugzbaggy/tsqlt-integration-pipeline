@@ -47,14 +47,23 @@ for i in $(seq 1 60); do sqlq -l 5 -Q "SELECT 1" >/dev/null 2>&1 && { ready=1; b
 # Load the whole schema file (defines every class) but RUN only the changed objects' classes,
 # so a PR still checks exactly what it changed. Full mode (empty OBJECTS) loads all + RunAll.
 declare -A SCHEMA_FILES=()   # unique schema files to load
-declare -a RUN_CLASSES=()    # specific classes to run (scoped mode)
+declare -a RUN_CLASSES=()
+declare -a RUN_OBJECTS=()    # specific classes to run (scoped mode)
+declare -a NOFILE_OBJECTS=() # changed objects whose SCHEMA has no baseline file at all
 scoped=1
 if [ -n "$(printf '%s' "$OBJECTS" | tr -d '[:space:]')" ]; then
     for so in $OBJECTS; do
         sch="${so%%.*}"; obj="${so#*.}"
         f="$CONTRACT_DIR/$sch.sql"
-        if [ -f "$f" ]; then SCHEMA_FILES["$f"]=1; RUN_CLASSES+=("test_contract_${sch}_${obj}")
-        else echo "    (no contract test for changed object $so — new object? run gen-auto-tests.sh)"; fi
+        if [ -f "$f" ]; then SCHEMA_FILES["$f"]=1; RUN_CLASSES+=("test_contract_${sch}_${obj}"); RUN_OBJECTS+=("$so")
+        else
+            # A whole schema with no baseline file is the SAME gap as a missing class, and it used
+            # to be dropped right here: nothing was recorded, so the PR comment fell back to "your
+            # PR changed no stored procedure or function" - the exact symptom observed live the
+            # first time a brand-new object with no baseline yet reached this script.
+            echo "    (no contract baseline file for schema $sch - $so has no baseline yet; run gen-auto-tests.sh)"
+            NOFILE_OBJECTS+=("$so")
+        fi
     done
     echo "==> [$LABEL] scoped to ${#RUN_CLASSES[@]} changed object(s) across ${#SCHEMA_FILES[@]} schema file(s)."
 else
@@ -62,8 +71,24 @@ else
     while IFS= read -r f; do SCHEMA_FILES["$f"]=1; done < <(find "$CONTRACT_DIR" -maxdepth 1 -type f -name '*.sql' 2>/dev/null | sort)
     echo "==> [$LABEL] full suite: ${#SCHEMA_FILES[@]} schema file(s)."
 fi
+
+# Objects with no baseline, for the PR comment and for autogen-missing-baselines.sh. Written on
+# EVERY scoped run, including the early exit below: a file that was never written reads as
+# "nothing was missing", which is how a real gap got reported as "nothing changed".
+MISSING_OBJECTS=""
+for o in ${NOFILE_OBJECTS[@]+"${NOFILE_OBJECTS[@]}"}; do MISSING_OBJECTS="$MISSING_OBJECTS $o"; done
+write_missing() {
+    [ "$scoped" = "1" ] || return 0
+    printf '%s' "${MISSING_OBJECTS# }" > "$ARTIFACTS_DIR/contract-missing-${LABEL}.txt"
+}
+
 if [ "${#SCHEMA_FILES[@]}" -eq 0 ]; then
-    echo "==> [$LABEL] no contract tests to run — nothing to check."
+    write_missing
+    if [ -n "$MISSING_OBJECTS" ]; then
+        echo "==> [$LABEL] no contract baseline exists for the changed object(s) - nothing could be checked."
+    else
+        echo "==> [$LABEL] no contract tests to run - nothing to check."
+    fi
     exit 0
 fi
 
@@ -83,6 +108,41 @@ for f in "${!SCHEMA_FILES[@]}"; do
 done
 [ "$load_failed" = "0" ] || { echo "ERROR: [$LABEL] one or more contract test files failed to load." >&2; exit 1; }
 
+# A changed object can have NO test class at all - typically a brand-new object whose baseline was
+# never generated. The scoping above only proves the SCHEMA FILE exists, so such an object was
+# added to the run list, produced nothing, and the PR comment then said "not run - your PR changed
+# no stored procedure or function" (observed live on PRs whose changed objects genuinely had no
+# baseline). Verify each class really exists, name the ones that do not, and record them.
+declare -a RUN_OK=()
+if [ "$scoped" = "1" ] && [ "${#RUN_CLASSES[@]}" -gt 0 ]; then
+    # List every contract class the DB has and match locally. An IN (...) of one class per changed
+    # object grows with the PR and would eventually exceed what sqlcmd accepts; this query is a
+    # fixed size no matter how much the PR touches.
+    present="$(sqlq -d "$DB" -h -1 -W -Q "SET NOCOUNT ON; SELECT name FROM sys.schemas WHERE name LIKE 'test[_]contract[_]%';")"
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+        # Reading silence as "absent" marks EVERY class missing, runs nothing, and tells the author
+        # there is no baseline for objects whose baselines are committed and fine. Fail loudly.
+        echo "ERROR: [$LABEL] could not list test classes (sqlcmd exit $rc) - refusing to report" >&2
+        echo "       objects as missing a baseline when the query never answered." >&2
+        exit 2
+    fi
+    present="$(printf '%s' "$present" | sed -e 's/[[:space:]]*$//')"
+    i=0
+    for c in ${RUN_CLASSES[@]+"${RUN_CLASSES[@]}"}; do
+        if printf '%s\n' "$present" | grep -qx -- "$c"; then
+            RUN_OK+=("$c")
+        else
+            echo "    (no contract test for changed object ${RUN_OBJECTS[$i]} - no baseline yet; run gen-auto-tests.sh)"
+            MISSING_OBJECTS="$MISSING_OBJECTS ${RUN_OBJECTS[$i]}"
+        fi
+        i=$((i+1))
+    done
+    RUN_CLASSES=(${RUN_OK[@]+"${RUN_OK[@]}"})
+    echo "==> [$LABEL] ${#RUN_CLASSES[@]} of ${#RUN_OBJECTS[@]} changed object(s) have a baseline to check."
+fi
+write_missing
+
 echo "==> [$LABEL] Running contract suite ..."
 if [ "$scoped" = "1" ]; then
     # tSQLt.Run TRUNCATES tSQLt.TestResult on every call, so running one class per sqlcmd
@@ -96,7 +156,7 @@ if [ "$scoped" = "1" ]; then
     run_sql="SET NOCOUNT ON;
 CREATE TABLE #acc (Class nvarchar(max), TestCase nvarchar(max), TranName nvarchar(max),
                    Result nvarchar(max), Msg nvarchar(max), TestStartTime datetime2, TestEndTime datetime2);"
-    for c in "${RUN_CLASSES[@]}"; do
+    for c in ${RUN_CLASSES[@]+"${RUN_CLASSES[@]}"}; do
         esc=${c//\'/\'\'}
         run_sql="$run_sql
 BEGIN TRY EXEC tSQLt.Run '$esc'; END TRY BEGIN CATCH END CATCH;
@@ -117,7 +177,7 @@ fi
 
 read -r TOTAL FAILED < <(sqlq -d "$DB" -h -1 -W -Q "SET NOCOUNT ON;
     SELECT CAST(COUNT(*) AS varchar(10)) + ' '
-         + CAST(SUM(CASE WHEN Result <> 'Success' THEN 1 ELSE 0 END) AS varchar(10))
+         + CAST(ISNULL(SUM(CASE WHEN Result <> 'Success' THEN 1 ELSE 0 END),0) AS varchar(10))
     FROM tSQLt.TestResult;" 2>/dev/null | tr -d '\r')
 TOTAL="${TOTAL:-0}"; FAILED="${FAILED:-0}"
 echo "==> [$LABEL] contract gate: $TOTAL run, $FAILED changed/failed."

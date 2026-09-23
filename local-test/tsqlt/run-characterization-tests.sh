@@ -29,6 +29,7 @@ OBJECTS="${OBJECTS:-}"
 TSQLT_DIR="${TSQLT_DIR:-/tmp/tsqlt}"
 ARTIFACTS_DIR="${ARTIFACTS_DIR:-artifacts}"
 LABEL="${LABEL:-$DB}"
+HERE="$(cd "$(dirname "$0")" && pwd)"
 
 SQLCMD="$(command -v sqlcmd || true)"
 [ -z "$SQLCMD" ] && [ -x /opt/mssql-tools18/bin/sqlcmd ] && SQLCMD=/opt/mssql-tools18/bin/sqlcmd
@@ -42,17 +43,59 @@ ready=0
 for i in $(seq 1 60); do sqlq -l 5 -Q "SELECT 1" >/dev/null 2>&1 && { ready=1; break; }; sleep 3; done
 [ "$ready" = "1" ] || { echo "ERROR: SQL not ready — cannot run characterization tests." >&2; exit 2; }
 
+# Characterization baselines exist ONLY for objects the generator can cover: deterministic scalar
+# functions. The predicate is char-eligible.where.sql - the SAME file gen-characterization-tests.sh
+# selects with, so the two can't drift. A stored procedure will never have a test_char_ class, so
+# reporting one as "no baseline yet - run gen-characterization-tests.sh" is a warning no command
+# can ever clear; ask the DB what is eligible before deciding anything is missing.
+ELIGIBLE=""
+if [ -n "$(printf '%s' "$OBJECTS" | tr -d '[:space:]')" ]; then
+    ELIG_WHERE="$(cat "$HERE/char-eligible.where.sql" 2>/dev/null || true)"
+    [ -n "$ELIG_WHERE" ] || { echo "ERROR: char-eligible.where.sql missing next to this script." >&2; exit 2; }
+    # Via an input FILE, not -Q: sqlcmd mangles a multi-line -Q string that carries SQL comments
+    # (proved live against the local DB - the same query returns the 8 eligible functions with -i
+    # and "Incorrect syntax near '('" with -Q). A file has no command-line length limit either.
+    elig_q="$ARTIFACTS_DIR/characterization-eligible-query-${LABEL}.sql"
+    cat > "$elig_q" <<SQL
+SET NOCOUNT ON;
+SELECT (s.name COLLATE DATABASE_DEFAULT)+'.'+(o.name COLLATE DATABASE_DEFAULT)
+FROM sys.objects o JOIN sys.schemas s ON s.schema_id=o.schema_id
+CROSS APPLY (SELECT def = OBJECT_DEFINITION(o.object_id)) d2
+WHERE (
+$ELIG_WHERE
+);
+SQL
+    ELIGIBLE="$(sqlq -d "$DB" -h -1 -W -i "$elig_q")"
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+        echo "ERROR: [$LABEL] could not list characterization-eligible functions (sqlcmd exit $rc) -" >&2
+        echo "       refusing to guess which changed objects should have a baseline." >&2
+        exit 2
+    fi
+    ELIGIBLE="$(printf '%s' "$ELIGIBLE" | sed -e 's/[[:space:]]*$//')"
+fi
+is_eligible() { printf '%s\n' "$ELIGIBLE" | grep -qx -- "$1"; }
+
 # One file per SCHEMA ($CHAR_DIR/<schema>.sql): load the whole file (defines its classes) but
 # RUN only the changed objects' classes. Full mode (empty OBJECTS) loads all + RunAll.
 declare -A SCHEMA_FILES=()
 declare -a RUN_CLASSES=()
+declare -a RUN_OBJECTS=()
+declare -a NOFILE_OBJECTS=()
 scoped=1
 if [ -n "$(printf '%s' "$OBJECTS" | tr -d '[:space:]')" ]; then
     for so in $OBJECTS; do
         sch="${so%%.*}"; obj="${so#*.}"
+        if ! is_eligible "$so"; then
+            echo "    ($so is not a deterministic scalar function - characterization does not cover it)"
+            continue
+        fi
         f="$CHAR_DIR/$sch.sql"
-        if [ -f "$f" ]; then SCHEMA_FILES["$f"]=1; RUN_CLASSES+=("test_char_${sch}_${obj}")
-        else echo "    (no characterization test for changed object $so — not a deterministic scalar fn, or new)"; fi
+        if [ -f "$f" ]; then SCHEMA_FILES["$f"]=1; RUN_CLASSES+=("test_char_${sch}_${obj}"); RUN_OBJECTS+=("$so")
+        else
+            echo "    (no characterization baseline file for schema $sch - $so has no baseline yet; run gen-characterization-tests.sh)"
+            NOFILE_OBJECTS+=("$so")
+        fi
     done
     echo "==> [$LABEL] scoped to ${#RUN_CLASSES[@]} changed object(s) across ${#SCHEMA_FILES[@]} schema file(s)."
 else
@@ -60,8 +103,23 @@ else
     while IFS= read -r f; do SCHEMA_FILES["$f"]=1; done < <(find "$CHAR_DIR" -maxdepth 1 -type f -name '*.sql' 2>/dev/null | sort)
     echo "==> [$LABEL] full suite: ${#SCHEMA_FILES[@]} schema file(s)."
 fi
+
+# Written on EVERY scoped run, including the early exit below: an unwritten file reads as
+# "nothing was missing", which is how a real gap got reported as "nothing changed".
+MISSING_OBJECTS=""
+for o in ${NOFILE_OBJECTS[@]+"${NOFILE_OBJECTS[@]}"}; do MISSING_OBJECTS="$MISSING_OBJECTS $o"; done
+write_missing() {
+    [ "$scoped" = "1" ] || return 0
+    printf '%s' "${MISSING_OBJECTS# }" > "$ARTIFACTS_DIR/characterization-missing-${LABEL}.txt"
+}
+
 if [ "${#SCHEMA_FILES[@]}" -eq 0 ]; then
-    echo "==> [$LABEL] no characterization tests to run — nothing to check."
+    write_missing
+    if [ -n "$MISSING_OBJECTS" ]; then
+        echo "==> [$LABEL] no characterization baseline exists for the changed function(s) - nothing could be checked."
+    else
+        echo "==> [$LABEL] no characterization tests to run - nothing to check."
+    fi
     exit 0
 fi
 
@@ -78,6 +136,34 @@ for f in "${!SCHEMA_FILES[@]}"; do
 done
 [ "$load_failed" = "0" ] || { echo "ERROR: [$LABEL] one or more characterization test files failed to load." >&2; exit 1; }
 
+# The scoping above only proves the SCHEMA FILE exists, so an eligible function with no generated
+# class was added to the run list, produced nothing, and the PR comment then said "not run - your
+# PR changed no stored procedure or function". Verify each class really exists.
+declare -a RUN_OK=()
+if [ "$scoped" = "1" ] && [ "${#RUN_CLASSES[@]}" -gt 0 ]; then
+    present="$(sqlq -d "$DB" -h -1 -W -Q "SET NOCOUNT ON; SELECT name FROM sys.schemas WHERE name LIKE 'test[_]char[_]%';")"
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+        echo "ERROR: [$LABEL] could not list test classes (sqlcmd exit $rc) - refusing to report" >&2
+        echo "       functions as missing a baseline when the query never answered." >&2
+        exit 2
+    fi
+    present="$(printf '%s' "$present" | sed -e 's/[[:space:]]*$//')"
+    i=0
+    for c in ${RUN_CLASSES[@]+"${RUN_CLASSES[@]}"}; do
+        if printf '%s\n' "$present" | grep -qx -- "$c"; then
+            RUN_OK+=("$c")
+        else
+            echo "    (no characterization test for changed object ${RUN_OBJECTS[$i]} - no baseline yet; run gen-characterization-tests.sh)"
+            MISSING_OBJECTS="$MISSING_OBJECTS ${RUN_OBJECTS[$i]}"
+        fi
+        i=$((i+1))
+    done
+    RUN_CLASSES=(${RUN_OK[@]+"${RUN_OK[@]}"})
+    echo "==> [$LABEL] ${#RUN_CLASSES[@]} of ${#RUN_OBJECTS[@]} changed function(s) have a baseline to check."
+fi
+write_missing
+
 echo "==> [$LABEL] Running characterization suite ..."
 if [ "$scoped" = "1" ]; then
     # Same defect as run-contract-tests.sh: tSQLt.Run TRUNCATES tSQLt.TestResult on every call,
@@ -87,7 +173,7 @@ if [ "$scoped" = "1" ]; then
     run_sql="SET NOCOUNT ON;
 CREATE TABLE #acc (Class nvarchar(max), TestCase nvarchar(max), TranName nvarchar(max),
                    Result nvarchar(max), Msg nvarchar(max), TestStartTime datetime2, TestEndTime datetime2);"
-    for c in "${RUN_CLASSES[@]}"; do
+    for c in ${RUN_CLASSES[@]+"${RUN_CLASSES[@]}"}; do
         esc=${c//\'/\'\'}
         run_sql="$run_sql
 BEGIN TRY EXEC tSQLt.Run '$esc'; END TRY BEGIN CATCH END CATCH;
@@ -108,7 +194,7 @@ fi
 
 read -r TOTAL FAILED < <(sqlq -d "$DB" -h -1 -W -Q "SET NOCOUNT ON;
     SELECT CAST(COUNT(*) AS varchar(10)) + ' '
-         + CAST(SUM(CASE WHEN Result <> 'Success' THEN 1 ELSE 0 END) AS varchar(10))
+         + CAST(ISNULL(SUM(CASE WHEN Result <> 'Success' THEN 1 ELSE 0 END),0) AS varchar(10))
     FROM tSQLt.TestResult;" 2>/dev/null | tr -d '\r')
 TOTAL="${TOTAL:-0}"; FAILED="${FAILED:-0}"
 echo "==> [$LABEL] characterization gate: $TOTAL run, $FAILED changed/failed."

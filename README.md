@@ -20,9 +20,11 @@ Nothing is shared between runs. The container is discarded afterwards.
 2. A fresh, disposable SQL Server 2022 starts        ← nothing shared
 3. Your schema is published + integrity-checked      ← THE GATE
 4. Auto-generated tests run for each changed object  ← report-only
-5. Curated hand-written tests run                    ← report-only
-6. A ready-to-finish test starter is generated       ← attached to the build
-7. A summary comment is posted on your PR
+5. A missing contract/characterization baseline (new object) is generated for you
+                                                      ← attached to the build, never pushed by default
+6. Curated hand-written tests run                    ← report-only
+7. A ready-to-finish test starter is generated       ← attached to the build
+8. A summary comment is posted on your PR
 ```
 
 **Only step 3 can block you.** Everything else is informational — which is the
@@ -52,10 +54,11 @@ That builds your DACPACs, starts SQL Server 2022 in Docker, publishes the
 schema, seeds reference data, and runs `verify.sql`.
 
 ```bash
-./tsqlt/run-curated-tests.sh          # hand-written tests
-./tsqlt/gen-auto-tests.sh             # generate tests for changed objects
-./tsqlt/run-characterization-tests.sh # pin current behaviour before refactoring
-./unitautogen/coverage.sh             # line coverage report
+./tsqlt/run-curated-tests.sh              # hand-written tests
+./tsqlt/gen-auto-tests.sh                 # generate contract tests for changed objects
+./tsqlt/run-characterization-tests.sh     # pin current behaviour before refactoring
+./tsqlt/autogen-missing-baselines.sh      # generate a baseline for a brand-new object only
+./unitautogen/coverage.sh                 # line coverage report
 ```
 
 ## Layout

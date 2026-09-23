@@ -98,6 +98,58 @@ tests connect as `sa`, so they're pure noise and a source of orphaned-user failu
 | `seed/30_authapi_key.sql` | Proposed workaround for the symmetric-key blocker (see below): seeds a re-encrypted test API key |
 | `verify.sql` | End-to-end smoke test run last; `THROW`s on any failure so `db-up` exits non-zero (green/red gate for CI and the "validate spin-up" task) |
 
+## Contract, characterization & curated tests (`tsqlt/`)
+
+Once a DB is up, `tsqlt/` holds the auto-generated and hand-written tSQLt suites the pipeline
+runs against whatever this branch just published:
+
+| File | Role |
+|---|---|
+| `gen-auto-tests.sh` | generates **contract** baselines (parameter signature + first result-set) for every proc/function, from catalog metadata only — no execution |
+| `gen-characterization-tests.sh` | generates **characterization** baselines (output for a fixed representative input) for eligible deterministic scalar functions |
+| `char-eligible.where.sql` | the ONE predicate for "can this object have a characterization baseline at all?" — shared by the generator and the runner so the two can't drift |
+| `run-contract-tests.sh` / `run-characterization-tests.sh` | run those baselines, scoped to a PR's changed objects |
+| `autogen-missing-baselines.sh` | generates a baseline for an object that has **none yet**, without ever touching one that already exists |
+| `run-curated-tests.sh` / `gen-starter-tests.sh` / `gen-scaffolds.mjs` | the hand-written suite and its ready-to-finish starters |
+
+Both baseline kinds are golden-master style: zero hand-written assertions, just "does the live
+value still match the committed one". An intended change makes the test RED and you regenerate
+the baseline with the matching `gen-*` script (a reviewable diff on the PR).
+
+**What "eligible" means for characterization.** It covers only **deterministic scalar
+functions** — no table/view reads, no `GETDATE`/`NEWID`/`RAND`-style built-ins — the one shape
+whose output can be captured once and compared forever. A stored procedure, or a function that
+reads a table, is simply out of scope: it will never get a `test_char_` class, so reporting it
+as "missing a baseline" would be a warning no command could ever clear. `char-eligible.where.sql`
+is the single source of truth for that boundary; if the generator and the runner each carried
+their own copy of the predicate, a changed stored procedure would start getting flagged as
+missing a baseline it can never produce.
+
+**Missing baselines are generated for you.** A PR that changes an object with no contract or
+characterization baseline yet (a brand-new object, or one nobody ever generated) used to just
+report "nothing ran" — someone had to remember to run the right `gen-*` script by hand and
+commit the result. `autogen-missing-baselines.sh` closes that gap: it regenerates the object's
+schema file and keeps the result **only when the diff is purely additive** (zero deleted
+lines) — any deletion means an *existing* baseline moved, which is a real change for a human to
+review, so the file is reverted instead of silently overwritten. A schema with no baseline file
+in git at all is additive by definition (there's nothing to overwrite), so that file is simply
+kept.
+
+It never pushes to your branch by default — it generates and archives the result, and the
+pipeline's PR comment says so. The `AUTO_COMMIT_BASELINES` build parameter makes it commit and
+push instead, with its own guardrails (never to `dev`/`main`/`master`/`release/*`, never onto a
+PR's pseudo-branch, never on top of a merge commit, never twice in a row).
+
+It runs as three phases — `precheck` / `generate` / `verify` — because generating needs
+`sqlcmd` and the additive-only guard needs `git`, and in the pipeline those live in different
+containers of the same pod. `PHASE=all` (the default) runs all three in order and is what you
+want anywhere both tools exist, such as this local kit:
+
+```bash
+PHASE=all KIND=contract DB=AppDb_Dev OUT_ROOT=tests/contract/AppDb_MSG LABEL=AppDb_MSG \
+    ./tsqlt/autogen-missing-baselines.sh 'core.SomeNewProc'
+```
+
 ## CI / Kubernetes
 
 `ci-publish.sh` is the orchestrator-agnostic core of `db-up`, for when SQL is started by
