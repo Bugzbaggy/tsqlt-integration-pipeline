@@ -1,0 +1,37 @@
+# CI overlay for docker-compose.yml — adds a "tools" container that builds THIS branch's
+# dacpacs and publishes them into the sqlserver service via ci-publish.sh. Everything runs
+# in containers on the compose network, so a Jenkins/Linux agent needs only Docker.
+#
+#   docker compose -f local-test/docker-compose.yml up -d --wait                          # start SQL 2022
+#   docker compose -f local-test/docker-compose.yml -f local-test/docker-compose.ci.yml \
+#       run --rm --build tools                                                             # build + publish + verify
+#   docker compose -f local-test/docker-compose.yml -f local-test/docker-compose.ci.yml down -v
+services:
+  tools:
+    build:
+      context: ..
+      dockerfile: local-test/tools.Dockerfile
+    depends_on:
+      sqlserver:
+        condition: service_healthy
+    environment:
+      # In-network: reach the sqlserver service directly on 1433 (not the host-mapped 14330).
+      SERVER: sqlserver
+      PORT: "1433"
+      # Defaults match docker-compose.yml (throwaway, not a secret). Read from env so
+      # db-up.sh/db-up.ps1 can override password/DB names in lock-step with the sqlserver
+      # service; CI sets them explicitly, unset -> these defaults.
+      SA_PASSWORD: "${SA_PASSWORD:-Local_Test_P@ssw0rd1}"
+      MSG_DB: "${MSG_DB:-AppDb_Dev}"
+      DATA_DB: "${DATA_DB:-AppDb_MSG_Data_Dev}"
+    volumes:
+      - ..:/repo          # the checked-out repo (source + where dacpacs get built)
+    working_dir: /repo
+    # Build the branch's dacpacs, then bootstrap + publish + seed + verify. A non-zero exit
+    # (verify.sql THROWs) propagates via `run --exit-code-from`/`run` and fails the pipeline.
+    # Non-login shell (bash -c, not -lc): a login shell re-sources /etc/profile and would
+    # rebuild PATH, dropping the image's /opt/sqlpackage + /opt/mssql-tools18 entries.
+    command:
+      - bash
+      - -c
+      - dotnet build AppDb_MSG.sln -c Release && bash local-test/ci-publish.sh

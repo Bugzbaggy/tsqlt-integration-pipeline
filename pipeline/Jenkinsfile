@@ -1,0 +1,1136 @@
+// Integration-test pipeline (PROJ-000 / PROJ-000): publish THIS branch's dacpacs into the
+// mssql-2022 sidecar of the shared K8s pod agent, run the integration/E2E suite, then let
+// the pod get recycled (no explicit teardown — nothing here is a long-lived shared instance).
+//
+// No docker-compose: local-test/ci-publish.sh and local-test/unitautogen/coverage.sh were
+// both already written to run directly against a same-pod sidecar over localhost (see their
+// own header comments) — docker-compose.yml/.ci.yml/.unitautogen.yml stay in the repo only
+// for the local dev workflow (db-up.sh/db-up.ps1) and a generic docker-only Jenkins agent;
+// this pipeline doesn't need them.
+
+// ---- Site-specific names: rename these to match your own Jenkins ---------------------------
+// Script-level (binding) variables, so the agent block, the environment block and the helper
+// methods below all read the same value. Nothing else in this file hard-codes them.
+//   POD_TEMPLATE      Kubernetes pod template to inherit from. It must provide a `dotnet-8`
+//                     container (dotnet SDK + git + the checkout) and an `mssql-2022` container
+//                     (SQL Server 2022 + sqlcmd + sqlpackage).
+//   SA_PASSWORD_CRED  secret-text credential holding the sa password the `mssql-2022`
+//                     container is provisioned with (MSSQL_SA_PASSWORD) - they must match, or
+//                     ci-publish.sh / coverage.sh cannot connect.
+//   GITHUB_CRED       username/password credential (app id + token) used for the commit
+//                     status, the PR comment and the opt-in baseline push.
+//   BOT_GIT_NAME      author name of the opt-in auto-baseline commit.
+POD_TEMPLATE     = 'sql-ci-agent'
+SA_PASSWORD_CRED = 'sql-sa-password'
+GITHUB_CRED      = 'github-ci-token'
+BOT_GIT_NAME     = 'ci-baseline-bot'
+
+pipeline {
+  environment {
+    REPO_NAME = 'appdb-msg-db'
+    GITHUB_TOKEN_CREDENTIALS_ID = "${GITHUB_CRED}"
+    MSG_DB  = 'AppDb_Dev'
+    DATA_DB = 'AppDb_MSG_Data_Dev'
+    SA_PASSWORD = credentials("${SA_PASSWORD_CRED}")
+  }
+
+  agent {
+    kubernetes {
+      inheritFrom POD_TEMPLATE
+      defaultContainer 'mssql-2022'
+    }
+  }
+
+  options {
+    // One run per branch at a time — a newer push supersedes an in-flight run instead of
+    // piling up parallel K8s pods (which contend for PVCs/nodes and cause spurious failures).
+    disableConcurrentBuilds()
+    // No skipStagesAfterUnstable(): every test stage is report-only and may go UNSTABLE — the
+    // five catchError(stageResult: 'UNSTABLE') wrappers below plus Coverage's own try/catch —
+    // and an UNSTABLE report stage must never skip the stages after it.
+    buildDiscarder(logRotator(daysToKeepStr: '7'))
+    timeout(time: 30, unit: 'MINUTES')
+  }
+
+  parameters {
+    // The integration/E2E suite lives outside this repo (appdb-AppCatalog). Provide the
+    // shell command that runs it against the published DB via the exported TEST_SQL_* env
+    // vars, or trigger a downstream job (see the commented example in the test stage). Left
+    // blank, the run still publishes + schema-verifies the DB (the smoke gate).
+    booleanParam(name: 'AUTO_COMMIT_BASELINES', defaultValue: false,
+           description: 'OFF by default: missing baselines are generated and archived, and the PR comment says so - nothing is pushed, so no branch of yours is ever touched. Turn ON only if you want the pipeline to commit them to the PR branch for you.')
+    string(name: 'E2E_TEST_COMMAND', defaultValue: '',
+           description: 'Shell command that runs the integration/E2E tests against the published DB. Reads env TEST_SQL_SERVER / TEST_SQL_DB / TEST_SQL_USER / TEST_SQL_PASSWORD.')
+  }
+
+  stages {
+    stage("🔨 Build dacpacs") {
+      steps {
+        script { setBuildStatus('pending') }
+        container('dotnet-8') {
+          sh 'dotnet build AppDb_MSG.sln --configuration Release'
+          // Coverage (below) runs in the mssql-2022 sidecar, which has no git, so
+          // coverage.sh can't self-scope there ("git not found -> skip"). This container
+          // HAS git and the checked-out repo, so compute the affected schemas here and hand
+          // them to coverage via env.UA_SCHEMAS. Empty => a PR with no .sql changes => skip.
+          script {
+            env.UA_SCHEMAS = sh(returnStdout: true, script: '''
+              git config --global --add safe.directory "*" >/dev/null 2>&1 || true
+              bash local-test/unitautogen/affected-schemas.sh || true
+            ''').trim().replaceAll(/\s+/, ' ')
+            // Object-level scope (procs/functions the PR changed), split by project so each
+            // object is covered in the DB it lives in: AppDb_MSG -> AppDb_Dev (UA_OBJECTS),
+            // AppDb_MSG_data -> AppDb_MSG_Data_Dev (UA_DATA_OBJECTS). Both empty => no testable
+            // object changed => the Coverage stage is skipped entirely.
+            env.UA_OBJECTS = sh(returnStdout: true, script: '''
+              git config --global --add safe.directory "*" >/dev/null 2>&1 || true
+              bash local-test/unitautogen/affected-objects.sh AppDb_MSG || true
+            ''').trim().replaceAll(/\s+/, ' ')
+            env.UA_DATA_OBJECTS = sh(returnStdout: true, script: '''
+              git config --global --add safe.directory "*" >/dev/null 2>&1 || true
+              bash local-test/unitautogen/affected-objects.sh AppDb_MSG_data || true
+            ''').trim().replaceAll(/\s+/, ' ')
+            echo "Coverage scope — schemas: '${env.UA_SCHEMAS ?: '(none)'}' | main objects: '${env.UA_OBJECTS ?: '(none)'}' | data objects: '${env.UA_DATA_OBJECTS ?: '(none)'}'"
+          }
+        }
+      }
+    }
+
+    stage("🚀 Start SQL Server") {
+      steps {
+        container('mssql-2022') {
+          // The Jenkins Kubernetes plugin overrides every sidecar container's entrypoint
+          // with `sleep 9999999` (so it can exec steps into it on demand) — that bypasses
+          // the image's own ENTRYPOINT entirely, so nothing else in this pod starts
+          // sqlservr. setsid+nohup+redirected stdio detaches it from this exec session so
+          // it keeps running (on localhost:1433) for the later stages/steps to reach.
+          sh 'ACCEPT_EULA=Y MSSQL_SA_PASSWORD="$SA_PASSWORD" setsid nohup /opt/mssql/bin/sqlservr < /dev/null > /tmp/sqlservr.log 2>&1 &'
+        }
+      }
+    }
+
+    stage("🗄️ Publish + verify schema") {
+      steps {
+        // defaultContainer (mssql-2022) has sqlcmd + sqlpackage; ci-publish.sh's own wait
+        // loop polls until the sqlservr started above finishes first-run setup and starts
+        // accepting connections. It bootstraps, publishes this branch's dacpacs, seeds, and
+        // verifies (a non-zero exit — verify.sql THROWs on any failed check — fails the build).
+        sh 'bash local-test/ci-publish.sh'
+      }
+    }
+
+    stage("✅ tSQLt regression tests (report-only)") {
+      // Hand-verified tSQLt tests under tests/curated/ with REAL assertions — they catch
+      // regressions UnitAutogen can't (row-existence branches, table-valued functions on
+      // Linux). Runs on every PR (fast — tests FakeTable + seed synthetic rows); empty
+      // tests/curated => the runner passes cleanly.
+      //
+      // REPORT-ONLY for now: a failing curated test surfaces in the PR comment and marks
+      // THIS stage unstable, but does NOT fail the build. run-curated-tests.sh still exits
+      // non-zero (useful locally); catchError keeps the overall build green. To make it a
+      // hard merge gate later, drop the catchError so the non-zero exit fails the build.
+      steps {
+        catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+          sh 'bash local-test/unitautogen/fetch-deps.sh && bash local-test/tsqlt/run-curated-tests.sh'
+        }
+      }
+      post {
+        always {
+          // skipMarkingBuildUnstable so a failing curated test doesn't flip the build either.
+          junit testResults: 'artifacts/tsqlt-junit.xml', allowEmptyResults: true, skipMarkingBuildUnstable: true
+          archiveArtifacts artifacts: 'artifacts/tsqlt-junit.xml', allowEmptyArchive: true
+        }
+      }
+    }
+
+    stage("📐 Contract tests (report-only)") {
+      // Auto-generated signature + result-set contract tests (tests/contract/, NO hand-written
+      // assertions - each embeds a baseline and re-derives the live value from catalog metadata).
+      // For each proc/function the PR changed, assert its parameters and first result-set are
+      // unchanged vs the committed baseline; a change is surfaced here and the author regenerates
+      // the baseline with gen-auto-tests.sh (a reviewable diff). REPORT-ONLY. UA_OBJECTS ->
+      // AppDb_Dev, UA_DATA_OBJECTS -> AppDb_MSG_Data_Dev. Skipped when no proc/function changed.
+      when { expression { return env.UA_OBJECTS?.trim() || env.UA_DATA_OBJECTS?.trim() } }
+      steps {
+        catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+          sh '''
+            bash local-test/unitautogen/fetch-deps.sh
+            if [ -n "$UA_OBJECTS" ]; then
+              DB="$MSG_DB" CONTRACT_DIR=tests/contract/AppDb_MSG OBJECTS="$UA_OBJECTS" LABEL=AppDb_MSG \
+                bash local-test/tsqlt/run-contract-tests.sh || true
+            fi
+            if [ -n "$UA_DATA_OBJECTS" ]; then
+              DB="$DATA_DB" CONTRACT_DIR=tests/contract/AppDb_MSG_data OBJECTS="$UA_DATA_OBJECTS" LABEL=AppDb_MSG_data \
+                bash local-test/tsqlt/run-contract-tests.sh || true
+            fi
+          '''
+        }
+      }
+      post {
+        always {
+          junit testResults: 'artifacts/contract-junit-*.xml', allowEmptyResults: true, skipMarkingBuildUnstable: true
+          archiveArtifacts artifacts: 'artifacts/contract-junit-*.xml', allowEmptyArchive: true
+        }
+      }
+    }
+
+    stage("🔬 Characterization tests (report-only)") {
+      // Auto-generated Tier 2 behavioural tests (tests/characterization/, NO hand-written
+      // assertions): for each deterministic scalar function the PR changed, assert its OUTPUT
+      // for a fixed representative input is unchanged vs the committed baseline. A change is
+      // surfaced here and the author regenerates it with gen-characterization-tests.sh (a
+      // reviewable diff). REPORT-ONLY. Skipped when no proc/function changed.
+      when { expression { return env.UA_OBJECTS?.trim() || env.UA_DATA_OBJECTS?.trim() } }
+      steps {
+        catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+          sh '''
+            bash local-test/unitautogen/fetch-deps.sh
+            if [ -n "$UA_OBJECTS" ]; then
+              DB="$MSG_DB" CHAR_DIR=tests/characterization/AppDb_MSG OBJECTS="$UA_OBJECTS" LABEL=AppDb_MSG \
+                bash local-test/tsqlt/run-characterization-tests.sh || true
+            fi
+            if [ -n "$UA_DATA_OBJECTS" ]; then
+              DB="$DATA_DB" CHAR_DIR=tests/characterization/AppDb_MSG_data OBJECTS="$UA_DATA_OBJECTS" LABEL=AppDb_MSG_data \
+                bash local-test/tsqlt/run-characterization-tests.sh || true
+            fi
+          '''
+        }
+      }
+      post {
+        always {
+          junit testResults: 'artifacts/characterization-junit-*.xml', allowEmptyResults: true, skipMarkingBuildUnstable: true
+          archiveArtifacts artifacts: 'artifacts/characterization-junit-*.xml', allowEmptyArchive: true
+        }
+      }
+    }
+
+    stage("🧮 Auto-generate missing baselines") {
+      // Closes the only manual step left in this pipeline. When a PR changes an object that has
+      // NO baseline (a new object, or one never generated), there is nothing to check and someone
+      // had to remember to run the generator and commit the result. This does it - for BOTH kinds,
+      // which is why the stage sits AFTER the characterization run: that stage is what writes
+      // artifacts/characterization-missing-*.txt, and cleanWs() means there is no stale copy from
+      // a previous build. Placed before it, the characterization half could never fire.
+      //
+      // The safety rule is the whole design: the generators rewrite a WHOLE <schema>.sql, so
+      // regenerating IN PLACE could overwrite the baseline of an object whose interface
+      // legitimately CHANGED - destroying the signal these tests exist to raise. So generation goes
+      // to a SCRATCH tree and only the missing objects' blocks are APPENDED to the committed file:
+      // additive by construction. A zero-deletions check still runs as an assertion, and anything
+      // that cannot be added is reported as genfailed / localedits / refused, each with its own
+      // message.
+      //
+      // Skipped unless a runner actually reported a missing baseline.
+      when {
+        allOf {
+          expression { return env.UA_OBJECTS?.trim() || env.UA_DATA_OBJECTS?.trim() }
+          expression {
+            return sh(returnStdout: true, script: 'cat artifacts/contract-missing-*.txt artifacts/characterization-missing-*.txt 2>/dev/null | tr -d " \n"').trim()
+          }
+        }
+      }
+      steps {
+        catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+          // The generator needs sqlcmd, which only the mssql-2022 sidecar has; the additive-only
+          // guard needs git, which only dotnet-8 has (see the Build stage: the coverage stage's
+          // own self-scoping "git not found -> skip"). Both containers mount this same workspace,
+          // so each phase runs where its tool is. Running the lot in the default mssql container
+          // made the whole stage a silent no-op: no git -> the fail-closed guard exits 2 ->
+          // swallowed -> "success".
+          container('dotnet-8')   { script { autogenPhase('precheck') } }
+          container('mssql-2022') { script { autogenPhase('generate') } }
+          container('dotnet-8')   {
+            script { autogenPhase('verify') }
+            script { autoCommitBaselines() }
+            // A refusal is the one outcome of this stage that needs a person. Every call to the
+            // script is `|| true`, so exit 3 was swallowed; this puts it back on the build. Raised
+            // INSIDE the catchError, so the stage shows UNSTABLE and the build stays green - the
+            // same report-only contract as the other test stages. After autoCommitBaselines, so a
+            // refusal in one schema never blocks committing an additive baseline in another.
+            script {
+              // Three different causes, three different sentences. They shared one message that said
+              // "an existing baseline would have been rewritten" - and since blocks are appended now,
+              // that is the LEAST likely of the three: a transient generator failure was being
+              // reported to the author as an interface change in an object they never touched.
+              String genFailed = autogenList('genfailed')
+              String refused = autogenList('refused')
+              String localEdits = autogenList('localedits')
+              if (localEdits) {
+                echo "Auto-baselines: skipped schema(s) ${localEdits} - the committed baseline file has uncommitted local edits."
+              }
+              if (genFailed) {
+                error("Auto-baselines: the generator FAILED for schema(s) ${genFailed} - no baseline was written for them. See the archived *-autogen-gen-*.log for the error.")
+              }
+              if (refused) {
+                error("Auto-baselines: appending to schema(s) ${refused} would have rewritten an existing baseline, which must never happen - the blocks were reverted and it needs a person to look.")
+              }
+            }
+          }
+        }
+      }
+      post {
+        always {
+          archiveArtifacts artifacts: 'artifacts/*-autogen-*.txt, artifacts/*-autogen-gen-*.log, artifacts/*-error-*.txt, artifacts/autogen-gen/**, tests/contract/**, tests/characterization/**', allowEmptyArchive: true
+        }
+      }
+    }
+
+    stage("🧬 Test fixtures (db-unit-test-synth, report-only)") {
+      // For each proc/function this PR changed, capture the structural fixture the db-unit-test-synth
+      // skill consumes: signature, dependency tables to FakeTable, per-column types/nullability/
+      // defaults, FK closure, CHECK constraints, and the object definition — one JSON per object.
+      // A dev downloads these and runs the skill locally to synthesize high-coverage tSQLt tests
+      // without re-introspecting. STRUCTURE ONLY (from the published throwaway DB, never production).
+      // REPORT-ONLY: capture failures only mark the stage UNSTABLE. UA_OBJECTS -> MSG_DB,
+      // UA_DATA_OBJECTS -> DATA_DB. Skipped when no proc/function changed.
+      when { expression { return env.UA_OBJECTS?.trim() || env.UA_DATA_OBJECTS?.trim() } }
+      steps {
+        catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+          sh '''
+            set -u
+            SKILL=skills/db-unit-test-synth/scripts/introspect.sh
+            mkdir -p artifacts/fixtures
+            gen_fixtures() {
+              db="$1"; shift
+              for obj in "$@"; do
+                schema="${obj%%.*}"
+                mkdir -p "artifacts/fixtures/$schema"
+                if DB="$db" SA_PASSWORD="$SA_PASSWORD" bash "$SKILL" "$obj" > "artifacts/fixtures/$schema/$obj.json" 2>>artifacts/fixtures/errors.log; then
+                  echo "fixture ok: $db / $obj"
+                else
+                  echo "fixture FAILED (report-only): $db / $obj — see artifacts/fixtures/errors.log"
+                  rm -f "artifacts/fixtures/$schema/$obj.json"
+                fi
+              done
+            }
+            [ -n "${UA_OBJECTS:-}" ]      && gen_fixtures "$MSG_DB"  $UA_OBJECTS      || true
+            [ -n "${UA_DATA_OBJECTS:-}" ] && gen_fixtures "$DATA_DB" $UA_DATA_OBJECTS || true
+            echo "captured $(find artifacts/fixtures -name '*.json' | wc -l) fixture(s)."
+          '''
+        }
+      }
+      post {
+        always {
+          archiveArtifacts artifacts: 'artifacts/fixtures/**', allowEmptyArchive: true
+        }
+      }
+    }
+
+    stage("📊 Coverage (UnitAutogen, report-only)") {
+      // Auto-generates tSQLt tests + measures LINE coverage on the published DB (Cobertura +
+      // JUnit per schema). REPORT-ONLY: a fault or timeout only marks this stage UNSTABLE —
+      // it never fails the build. tSQLt/UnitAutogen are fetched at pinned versions. Caveats:
+      // local-test/unitautogen/README.md. Do NOT turn this into a merge gate as-is.
+      // Only run when the PR changed a testable object (a stored procedure or function, in
+      // either project). A PR that touches only tables/views/types has nothing UnitAutogen
+      // can test, so skip the whole stage — no wasted dep fetch, no whole-schema noise.
+      when { expression { return env.UA_OBJECTS?.trim() || env.UA_DATA_OBJECTS?.trim() } }
+      steps {
+        // catchError does not reliably suppress a FlowInterruptedException raised by
+        // timeout() firing — the underlying cause still carries Result.ABORTED and wins,
+        // aborting the whole build despite buildResult: 'SUCCESS' (observed live: a sweep
+        // that ran past 20 minutes ended the build ABORTED, not UNSTABLE). Catch it in
+        // Groovy directly instead, which handles the interrupt correctly.
+        script {
+          try {
+            timeout(time: 20, unit: 'MINUTES') {
+              // UA_OBJECTS / UA_DATA_OBJECTS were computed in the build stage (a git-capable
+              // container) and inherited here; coverage.sh uses them verbatim, so it needs no
+              // git in this sidecar. UA_OBJECTS -> MSG_DB, UA_DATA_OBJECTS -> DATA_DB.
+              sh 'bash local-test/unitautogen/fetch-deps.sh && UA_OBJECTS="$UA_OBJECTS" UA_DATA_OBJECTS="$UA_DATA_OBJECTS" UA_SCHEMAS="$UA_SCHEMAS" bash local-test/unitautogen/coverage.sh'
+              // Ready-to-finish curated-test STARTERS for the objects this PR changed: one
+              // compiling+running tSQLt test each (real FakeTables + call + smoke assert), from
+              // the live schema. Archived so a dev can download, add the SEED+ASSERT, and drop
+              // it into tests/curated/. Best-effort; never fails the build.
+              sh '''
+                mkdir -p artifacts/starters
+                [ -n "$UA_OBJECTS" ]      && OUT_ROOT=artifacts/starters MSG_DB="$MSG_DB"   bash local-test/tsqlt/gen-starter-tests.sh "$MSG_DB"  $UA_OBJECTS      || true
+                [ -n "$UA_DATA_OBJECTS" ] && OUT_ROOT=artifacts/starters DATA_DB="$DATA_DB" bash local-test/tsqlt/gen-starter-tests.sh "$DATA_DB" $UA_DATA_OBJECTS || true
+              '''
+            }
+          } catch (err) {
+            echo "UnitAutogen coverage (report-only) did not fully complete: ${err}"
+            currentBuild.result = 'UNSTABLE'
+          }
+        }
+      }
+      post {
+        always {
+          // Report-only: record the generated-test results for trends WITHOUT gating the build.
+          // skipMarkingBuildUnstable=true so an auto-generated tSQLt test that fails (expected —
+          // the generator is best-effort) does not flip the build to UNSTABLE.
+          junit testResults: 'artifacts/junit.*.xml', allowEmptyResults: true, skipMarkingBuildUnstable: true
+          archiveArtifacts artifacts: 'artifacts/*.xml, artifacts/starters/**', allowEmptyArchive: true
+        }
+      }
+    }
+
+    stage("🧪 Integration / E2E tests") {
+      steps {
+        script {
+          withEnv([
+            "TEST_SQL_SERVER=localhost,1433",
+            "TEST_SQL_DB=${env.MSG_DB}",
+            "TEST_SQL_USER=sa",
+            "TEST_SQL_PASSWORD=${env.SA_PASSWORD}"
+          ]) {
+            if (params.E2E_TEST_COMMAND?.trim()) {
+              echo "Running E2E suite against ${env.TEST_SQL_SERVER} / ${env.MSG_DB}"
+              sh params.E2E_TEST_COMMAND
+            } else {
+              // No external suite wired yet. The DB is up, published and schema-verified
+              // (VERIFY OK in the previous stage). This is the plug-in point — either set the
+              // E2E_TEST_COMMAND parameter, or trigger the downstream suite here, e.g.:
+              //
+              //   build job: 'E2E/appdb-AppCatalog/integration', wait: true, parameters: [
+              //     string(name: 'SQL_SERVER',   value: env.TEST_SQL_SERVER),
+              //     string(name: 'SQL_DB',       value: env.TEST_SQL_DB),
+              //     string(name: 'SQL_USER',     value: env.TEST_SQL_USER),
+              //     password(name: 'SQL_PASSWORD', value: env.TEST_SQL_PASSWORD)]
+              echo "No E2E_TEST_COMMAND set — schema smoke gate (VERIFY OK) passed in the previous stage."
+              echo "Published DB ready: Server=${env.TEST_SQL_SERVER};Database=${env.MSG_DB};User Id=sa;Password=***;TrustServerCertificate=True"
+            }
+          }
+        }
+      }
+    }
+  }
+
+  post {
+    always {
+      script {
+        // Post the integration-test result summary to this branch's open PR (best-effort).
+        postPrSummary()
+        if (currentBuild.result == null || currentBuild.result == 'SUCCESS') {
+          setBuildStatus('success')
+        } else {
+          setBuildStatus('failure')
+        }
+      }
+      cleanWs()
+    }
+  }
+}
+
+// Post a one-comment summary of this integration run onto the branch's open PR. Best-effort:
+// wrapped in try/catch and never fails the build. Uses the same httpRequest plugin + GitHub
+// credential as setBuildStatus. Branch jobs have no CHANGE_ID, so we look the PR up by head branch.
+def postPrSummary() {
+  try {
+    withCredentials([usernamePassword(credentialsId: env.GITHUB_TOKEN_CREDENTIALS_ID, usernameVariable: 'APP_ID', passwordVariable: 'KEY')]) {
+      def look = httpRequest(
+        url: "https://api.github.com/repos/example/${env.REPO_NAME}/pulls?head=example:${env.BRANCH_NAME}&state=open",
+        customHeaders: [[name: 'Authorization', value: "Bearer ${KEY}"], [name: 'Accept', value: 'application/vnd.github+json']],
+        validResponseCodes: '100:599')
+      def pr = firstPrNumber(look.content)
+      if (!pr) { echo "No open PR for '${env.BRANCH_NAME}'; skipping summary comment."; return }
+      // Read the per-object status files (artifacts/summary.<db>.<schema>.txt) that coverage.sh
+      // emits straight from TestGen.CoverageResult. Fields are '~|~'-joined, one row/object:
+      //   schema ~|~ object ~|~ type ~|~ gen(0|1) ~|~ testability ~|~ pass ~|~ fail ~|~ err ~|~ skip ~|~ covLines ~|~ totLines ~|~ reason
+      // We bucket on the SOURCE columns (not JUnit tags): a real assertion failure (fail>0) is
+      // reported as a failure; anything that only couldn't be generated/seeded (gen=0,
+      // NOT_TESTABLE, or errored) goes to a separate "couldn't auto-test" bucket so it never
+      // reads as "your change is broken". Object scope already excludes untouched objects, so
+      // every failure shown is on something THIS PR changed. awk uses print (no backslash
+      // escapes) so it survives Groovy's triple-quote string handling.
+      //
+      // counts: "objTotal passed assertionFails couldntTest coveredLines totalLines"
+      String countsRaw = sh(returnStdout: true, script: '''
+        ls artifacts/summary.*.txt >/dev/null 2>&1 || exit 0
+        awk 'BEGIN{FS="~[|]~"; ot=0;pass=0;af=0;ct=0;cc=0;vv=0}
+             { ot++; gen=$4; tst=$5; fl=$7+0; er=$8+0; cl=$10+0; tl=$11+0
+               if(gen=="1" && tst!="NOT_TESTABLE"){ cc+=cl; vv+=tl }
+               if(fl>0){ af++ }
+               else if(gen=="0" || tst=="NOT_TESTABLE" || er>0){ ct++ }
+               else { pass++ } }
+             END{ printf "%d %d %d %d %d %d", ot,pass,af,ct,cc,vv }' artifacts/summary.*.txt
+      ''').trim()
+      // "schema.object (type)" for each changed object, backticked. A "(data DB)" tag (from
+      // the summary filename) distinguishes the AppDb_MSG_Data_Dev copy — without it, a proc that
+      // exists in BOTH DBs with the same type label would collapse to one line under sort -u
+      // and the list would under-count vs the pass/fail counts. Cap in Groovy.
+      String objectsRaw = sh(returnStdout: true, script: '''
+        ls artifacts/summary.*.txt >/dev/null 2>&1 || exit 0
+        awk 'BEGIN{FS="~[|]~"}
+             { db=FILENAME; sub(/.*summary\\./,"",db); sub(/\\..*/,"",db);
+               tag=(db ~ /Data/)?" _(data DB)_":"";
+               print "`" $1 "." $2 "` (" $3 ")" tag }' artifacts/summary.*.txt | sort -u
+      ''').trim()
+      // Real assertion failures (fail>0) — the only thing shown as "failed". Capped at 8.
+      String failRaw = sh(returnStdout: true, script: '''
+        ls artifacts/summary.*.txt >/dev/null 2>&1 || exit 0
+        awk 'BEGIN{FS="~[|]~"} $7+0>0 { run=$6+$7+$8; print "- Test failed on `" $1 "." $2 "` (" $3 ") - " $7 " of " run " generated tests failed" }' artifacts/summary.*.txt | head -8
+      ''').trim()
+      // Couldn't-auto-test bucket (gen failed / NOT_TESTABLE / errored, and no assertion
+      // failure). The reason is specific to the sub-case when the tool didn't record one.
+      String cantRaw = sh(returnStdout: true, script: '''
+        ls artifacts/summary.*.txt >/dev/null 2>&1 || exit 0
+        awk 'BEGIN{FS="~[|]~"} { fl=$7+0; er=$8+0;
+               if(fl==0 && ($4=="0" || $5=="NOT_TESTABLE" || er>0)){
+                 r=$12;
+                 if(r==""){
+                   if($5=="NOT_TESTABLE") r="not auto-testable (needs input seeding the Linux generator cannot do)";
+                   else if($4=="0")       r="the generator could not build a runnable test for this construct";
+                   else if(er>0)          r="its auto-generated tests errored (input seeding unavailable on Linux)";
+                   else                   r="could not be auto-tested";
+                 }
+                 print "- `" $1 "." $2 "` (" $3 ") - " r } }' artifacts/summary.*.txt | head -8
+      ''').trim()
+
+      // Curated tSQLt result (report-only) — from its JUnit. "tests failures errors", empty
+      // if the stage didn't produce a report (e.g. it errored before running).
+      String gateRaw = sh(returnStdout: true, script: '''
+        jf=artifacts/tsqlt-junit.xml
+        [ -f "$jf" ] || exit 0
+        t=$(grep -o 'tests="[0-9]*"'    "$jf" | head -1 | tr -dc 0-9)
+        f=$(grep -o 'failures="[0-9]*"' "$jf" | head -1 | tr -dc 0-9)
+        e=$(grep -o 'errors="[0-9]*"'   "$jf" | head -1 | tr -dc 0-9)
+        printf '%s %s %s' "${t:-0}" "${f:-0}" "${e:-0}"
+      ''').trim()
+
+      // Contract-test result (report-only): interface (params + result-set) changes on the
+      // objects this PR touched. A "changed" count is not a failure - it means regenerate the
+      // baseline. Two files (one per DB); sum their testsuite counts.
+      String contractRaw = sh(returnStdout: true, script: '''
+        tot=0; bad=0
+        for jf in artifacts/contract-junit-*.xml; do
+          [ -f "$jf" ] || continue
+          t=$(grep -o 'tests="[0-9]*"'    "$jf" | head -1 | tr -dc 0-9)
+          f=$(grep -o 'failures="[0-9]*"' "$jf" | head -1 | tr -dc 0-9)
+          e=$(grep -o 'errors="[0-9]*"'   "$jf" | head -1 | tr -dc 0-9)
+          tot=$((tot + ${t:-0})); bad=$((bad + ${f:-0} + ${e:-0}))
+        done
+        printf '%s %s' "$tot" "$bad"
+      ''').trim()
+
+      // Characterization-test result (report-only): behaviour (output for a fixed input)
+      // changes on the deterministic scalar functions this PR touched.
+      String charRaw = sh(returnStdout: true, script: '''
+        tot=0; bad=0
+        for jf in artifacts/characterization-junit-*.xml; do
+          [ -f "$jf" ] || continue
+          t=$(grep -o 'tests="[0-9]*"'    "$jf" | head -1 | tr -dc 0-9)
+          f=$(grep -o 'failures="[0-9]*"' "$jf" | head -1 | tr -dc 0-9)
+          e=$(grep -o 'errors="[0-9]*"'   "$jf" | head -1 | tr -dc 0-9)
+          tot=$((tot + ${t:-0})); bad=$((bad + ${f:-0} + ${e:-0}))
+        done
+        printf '%s %s' "$tot" "$bad"
+      ''').trim()
+
+      // Scorecard headline sums (per-TEST, not per-object): objTotal genObjs sumPass sumFailErr
+      // sumSkip sumTests covLines totLines notTestable genFailed. Feeds the four stat cards
+      // and the subtitle line. Every value is derived from the run - nothing is assumed.
+      String scoreRaw = sh(returnStdout: true, script: '''
+        ls artifacts/summary.*.txt >/dev/null 2>&1 || exit 0
+        awk 'BEGIN{FS="~[|]~"; ob=0;gn=0;tp=0;tfe=0;ts=0;cc=0;vv=0;nt=0;gf=0}
+             { ob++; if($4=="1")gn++;
+               if($5=="NOT_TESTABLE") nt++; else if($4=="0") gf++;
+               tp+=$6+0; tfe+=($7+0)+($8+0); ts+=$9+0;
+               if($4=="1" && $5!="NOT_TESTABLE"){ cc+=$10+0; vv+=$11+0 } }
+             END{ printf "%d %d %d %d %d %d %d %d %d %d", ob,gn,tp,tfe,ts,tp+tfe+ts,cc,vv,nt,gf }' artifacts/summary.*.txt
+      ''').trim()
+
+      // Per-object scorecard rows (one markdown table row per changed object). There is no Branch %
+      // column: UnitAutogen cannot measure row-existence branches on SQL-for-Linux, so the cell was
+      // a hardcoded "n/a" on every row of every build - a column that can never carry a number is
+      // noise, not a gap to fill. Line % is real and stays. print only (no backslash
+      // escapes) so it survives Groovy's triple-quote handling; the (data DB) tag disambiguates the
+      // AppDb_MSG_Data copy. Line % = covered/total, or "not testable" when the generator couldn't run.
+      String rowsRaw = sh(returnStdout: true, script: '''
+        ls artifacts/summary.*.txt >/dev/null 2>&1 || exit 0
+        awk 'BEGIN{FS="~[|]~"}
+             { db=FILENAME; sub(/.*summary\\./,"",db); sub(/\\..*/,"",db);
+               tag=(db ~ /Data/)?" _(data DB)_":"";
+               tests=($6+0)+($7+0)+($8+0)+($9+0); pass=$6+0; skip=$9+0;
+               if($11+0>0){ lp=sprintf("%.1f%%",($10*100.0)/($11+0)) } else { lp="n/a" }
+               # Keep the REAL counts even when the object is not testable: UnitAutogen still
+               # records a placeholder skipped test, and that test IS counted in the TOTAL row.
+               # Blanking the cells made the visible rows fail to add up to the TOTAL (observed
+               # live: rows showed 0 tests while TOTAL claimed 1). "not testable" in Line % already
+               # says why nothing was exercised.
+               if($4=="0" || $5=="NOT_TESTABLE"){ lp="not testable" }
+               print "| `" $1 "." $2 "` (" $3 ")" tag " | " tests " | " pass " | " skip " | " lp " |" }' artifacts/summary.*.txt | sort
+      ''').trim()
+
+      // Subtitle date. Computed in the shell so we never touch new Date()/format() under CPS.
+      String runDate = sh(returnStdout: true, script: 'date -u +%Y-%m-%d').trim()
+
+      // Objects the PR changed that have NO generated baseline yet. The runners now emit these;
+      // without them the comment said "your PR changed no stored procedure or function" over a PR
+      // that HAD changed one (observed live once a runner reported a real gap) - the tests simply
+      // had nothing to run.
+      String missContractRaw = sh(returnStdout: true, script: '''
+        cat artifacts/contract-missing-*.txt 2>/dev/null | tr ' ' '\n' | sed '/^$/d' | sort -u | tr '\n' ' '
+      ''').trim()
+      String missCharRaw = sh(returnStdout: true, script: '''
+        cat artifacts/characterization-missing-*.txt 2>/dev/null | tr ' ' '\n' | sed '/^$/d' | sort -u | tr '\n' ' '
+      ''').trim()
+      // What the auto-generate stage actually produced. It rewrites the missing-lists above to
+      // what is STILL missing, so those two reads can no longer contradict each other; this one
+      // is the objects that went from "no baseline" to "baseline", which reads differently again.
+      String addedContractRaw = sh(returnStdout: true, script: '''
+        cat artifacts/contract-autogen-added-*.txt 2>/dev/null | tr ' ' '\n' | sed '/^$/d' | sort -u | tr '\n' ' '
+      ''').trim()
+      String addedCharRaw = sh(returnStdout: true, script: '''
+        cat artifacts/characterization-autogen-added-*.txt 2>/dev/null | tr ' ' '\n' | sed '/^$/d' | sort -u | tr '\n' ' '
+      ''').trim()
+      // The runners write these when they ABORT (tSQLt install, a test file that would not load,
+      // a catalog query that never answered). Without them an abort looked exactly like "this PR
+      // changed nothing": no JUnit, no counts, so the row fell through to notRunMsg.
+      // Per DATABASE, and labelled. A bare `cat <kind>-error-*.txt | head -1` glued the two labels
+      // together and gave one anonymous reason, so the comment could not say which database had
+      // aborted - and the row below returned on it before it had even looked at the counts.
+      String contractErrRaw = sh(returnStdout: true, script: '''
+        for f in artifacts/contract-error-*.txt; do
+          [ -s "$f" ] || continue
+          b=$(basename "$f" .txt); printf '%s: %s; ' "${b#contract-error-}" "$(head -1 "$f")"
+        done
+      ''').trim().replaceAll(/;$/, '')
+      String charErrRaw = sh(returnStdout: true, script: '''
+        for f in artifacts/characterization-error-*.txt; do
+          [ -s "$f" ] || continue
+          b=$(basename "$f" .txt); printf '%s: %s; ' "${b#characterization-error-}" "$(head -1 "$f")"
+        done
+      ''').trim().replaceAll(/;$/, '')
+      // Objects the generator CANNOT produce a baseline for - a seeded call that returns NULL, an
+      // error, the 8000-char cap. They are eligible, so they used to sit on the missing list and
+      // the comment told the author to run a generator that would never emit for them: a warning
+      // with no way to clear it, which is the drift this whole mechanism exists to avoid.
+      String unsupContractRaw = sh(returnStdout: true, script: '''
+        cat artifacts/contract-autogen-unsupported-*.txt 2>/dev/null | tr ' ' '\n' | sed '/^$/d' | sort -u | tr '\n' ' '
+      ''').trim()
+      String unsupCharRaw = sh(returnStdout: true, script: '''
+        cat artifacts/characterization-autogen-unsupported-*.txt 2>/dev/null | tr ' ' '\n' | sed '/^$/d' | sort -u | tr '\n' ' '
+      ''').trim()
+      // The loudest signal the stage can produce, and until now the only reader was an echo inside
+      // autoCommitBaselines - AFTER its early return, so on the default path nothing said it at all.
+      // A refusal means regenerating would have moved an EXISTING baseline: a real interface or
+      // behaviour change that a person has to look at.
+      String refusedRaw = autogenList('refused')
+      String genFailedRaw = autogenList('genfailed')
+
+      // Which changed objects have no hand-written test yet, and the ready-to-finish starter
+      // for the first of them. The starter is already generated into artifacts/starters/; putting
+      // it IN the comment (collapsed) is what turns 'download the artifact' into copy-paste.
+      // Emits nothing at all when every changed object already has a curated test.
+      // Did the pipeline push a baseline commit to this branch? If so the author's local branch
+      // is now behind, and finding that out via a rejected push is exactly how people learn to
+      // distrust a bot. Say it in the comment instead - one line, only when it happened.
+      String autoPushed = sh(returnStdout: true, script: 'cat artifacts/autogen-committed.txt 2>/dev/null || true').trim()
+      String autoGenerated = sh(returnStdout: true, script: 'cat artifacts/autogen-generated.txt 2>/dev/null || true').trim()
+
+      String curatedMissingRaw = sh(returnStdout: true, script: '''
+        for o in $UA_OBJECTS $UA_DATA_OBJECTS; do
+          sch=${o%%.*}; obj=${o#*.}
+          [ -f "tests/curated/$sch/test_${sch}_${obj}.sql" ] || printf '%s ' "$o"
+        done
+      ''').trim()
+      String starterSql = sh(returnStdout: true, script: '''
+        first=$(for o in $UA_OBJECTS $UA_DATA_OBJECTS; do
+                  sch=${o%%.*}; obj=${o#*.}
+                  [ -f "tests/curated/$sch/test_${sch}_${obj}.sql" ] || { echo "$sch/$obj"; break; }
+                done)
+        [ -n "$first" ] || exit 0
+        f="artifacts/starters/${first%%/*}/test_${first%%/*}_${first#*/}.sql"
+        [ -f "$f" ] || exit 0
+        # The escapes are DOUBLED because this sits in a Groovy triple-quoted literal, which
+        # processes octal escapes before the shell ever sees the script: proved in the
+        # groovy:4-jdk17 container that the single-backslash form became a real NUL plus six
+        # other control bytes, so tr got a mangled argument and the starter block silently
+        # never rendered. One filter is enough: keep tab, newline and printable ASCII.
+        head -c 4000 "$f" | LC_ALL=C tr -cd '\\11\\12\\40-\\176'
+      ''').trim()
+
+      // Verdict from the build result. The deploy+VERIFY gate and the curated tSQLt gate both
+      // decide pass/fail; the coverage stage is report-only and never fails the build. GitHub
+      // emoji shortcodes are ASCII, so they render as icons without UTF-8 mangling.
+      String res = currentBuild.currentResult
+      boolean failed = (res == 'FAILURE')
+      String headline  = failed ? ':x: FAILED' : (res == 'SUCCESS' ? ':white_check_mark: PASSED' : ':warning: PASSED (with warnings)')
+      String deployRow = failed ? ':x: **Failed** - see the log' : ':white_check_mark: **Passed** - schema deployed, all integrity checks OK'
+
+      // Curated regression-test row (report-only). Optional, hand-written tSQLt tests.
+      int curTests = 0
+      int curBad = 0
+      String gateRow
+      if (gateRaw) {
+        String[] g = gateRaw.split(/\s+/)
+        if (g.length >= 3) {
+          curTests = g[0] as int
+          curBad = (g[1] as int) + (g[2] as int)
+        }
+        int gt = curTests
+        int gbad = curBad
+        gateRow = gt == 0 ? 'None added yet (the curated suite is empty)'
+                : (gbad > 0 ? ":x: **${gbad} of ${gt} failed**"
+                            : ":white_check_mark: all ${gt} passed")
+      } else {
+        gateRow = failed ? ':x: **Failed** - see the log' : 'None added yet (the curated suite is empty)'
+      }
+
+      // Changed procs/functions across BOTH DBs (AppDb_MSG + AppDb_MSG_data).
+      String allObjs = ((env.UA_OBJECTS ?: '') + ' ' + (env.UA_DATA_OBJECTS ?: '')).trim().replaceAll(/\s+/, ' ')
+      boolean noTestable = !allObjs
+      String notRunMsg = '_not run - your PR changed no stored procedure or function_'
+      // Characterization only covers DETERMINISTIC SCALAR FUNCTIONS. Reusing notRunMsg made the
+      // Behaviour row read 'your PR changed no stored procedure or function' directly above a
+      // table listing 16 changed procedures (observed live: rows read that message directly
+      // above such a table) - true for contract, false here.
+      String charNotRunMsg = '_not run - your PR changed no deterministic scalar function_'
+
+      // Objects changed (procs/functions actually assessed). Fall back to the git-computed
+      // list if the report produced no rows (e.g. coverage stage skipped or errored).
+      String objectsRow
+      if (objectsRaw) {
+        String[] ol = objectsRaw.split(/\r?\n/)
+        int cap = 15
+        objectsRow = (ol.length <= cap ? ol.toList() : ol.toList().subList(0, cap)).join(', ')
+        if (ol.length > cap) objectsRow += ", _+${ol.length - cap} more_"
+      } else if (!noTestable) {
+        objectsRow = "`${allObjs.replaceAll(/ +/, '`, `')}`"
+      } else {
+        objectsRow = '_none - your PR changed no procedures or functions_'
+      }
+
+      String testRow = notRunMsg
+      String covRow  = notRunMsg
+      if (countsRaw) {
+        String[] n = countsRaw.split(/\s+/)
+        int objTotal = n[0] as int, passed = n[1] as int, afails = n[2] as int, cant = n[3] as int
+        int cc = n[4] as int, vv = n[5] as int
+        int tested = passed + afails
+        if (tested > 0) {
+          testRow = (afails > 0 ? ":x: ${passed} of ${tested} passed, **${afails} with failing tests**"
+                                : ":white_check_mark: all ${tested} passed")
+          if (cant > 0) testRow += " _(+${cant} couldn't be auto-tested)_"
+        } else {
+          testRow = cant > 0 ? ":information_source: none could be auto-tested (${cant} object(s) - see below)"
+                             : '_no unit-test result_'
+        }
+        int cpct = vv > 0 ? ((cc * 100) / vv) as int : 0
+        covRow = vv > 0 ? "${cpct}% - ${cc} of ${vv} lines" : '_could not be measured (see below)_'
+      }
+
+      // Plain-English "what it means" so a non-DBA can read each row of the table.
+      String mDeploy = 'The only check that can block your PR. It confirms your schema applies to a brand-new database with no errors.'
+      String mTests  = "Tests the machine wrote and ran for you (best-effort). A failure usually means the generator guessed the wrong expected value - **not** that your change is broken."
+      String mCov    = 'Of the lines in the procedures you changed, how many the auto-generated tests actually executed. A low % is common (the generator cannot always build the data to reach every branch) and does not mean your code is untested.'
+      String mGate   = 'Hand-written tSQLt tests kept in `tests/curated/`. This is the WHOLE repo pass-through suite, not tests for your PR: it runs unchanged on every build, so a green tick here does NOT mean your changed objects have hand-written coverage. A person adds them for important logic (not auto-generated).'
+      String mObj    = 'The stored procedures / functions your PR changed (each checked in the database it lives in).'
+
+      // Why-section: framing first (these are machine guesses / limitations), then the lists.
+      String whyBlock = ''
+      if (failRaw)
+        whyBlock += "\n**Auto-tests that failed** - worth a glance, but these are the generator's guesses, so a failure often just means it predicted the wrong result rather than a bug in your change. To pin down the real behaviour, add a curated test:\n${failRaw}\n"
+      if (cantRaw)
+        whyBlock += "\n**Couldn't be auto-tested** - nothing to fix in your PR; the generator hit a limitation for each of these. Add a hand-written tSQLt test if you want them covered:\n${cantRaw}\n"
+
+      // Interface-contract row (report-only). "changed" prompts a baseline regen, not a fix -
+      // so :warning:, never :x:.
+      // "no tests ran" has TWO very different causes and they must not share a message:
+      //   (a) the PR changed no proc/function at all            -> notRunMsg (true)
+      //   (b) it changed one that has no generated baseline yet -> nothing could be checked.
+      // Case (b) used to render as (a), telling the author their PR "changed no stored procedure
+      // or function" directly above a table listing the procedure it changed.
+      String contractRow = baselineRow(contractRaw, missContractRaw, addedContractRaw, contractErrRaw, unsupContractRaw, (autoPushed as boolean), notRunMsg, 'gen-auto-tests.sh')
+      String mContract = 'Auto-generated checks (nobody hand-writes them) that your changed procedures/functions still take the same parameters and return the same columns. A change here just asks you to regenerate the baseline (a reviewable diff); it never blocks your PR.'
+
+      // Behaviour (characterization) row (report-only). Same five states, same renderer.
+      String charRow = baselineRow(charRaw, missCharRaw, addedCharRaw, charErrRaw, unsupCharRaw, (autoPushed as boolean), charNotRunMsg, 'gen-characterization-tests.sh')
+      String mChar = 'Auto-generated behaviour checks for the deterministic scalar functions you changed: the function still returns the same output for a fixed sample input. A change just asks you to regenerate the baseline; it never blocks your PR.'
+
+      // ---- Scorecard headline (four numbers) + per-object table, styled after the UnitAutogen
+      // coverage report. The deploy+VERIFY gate stays ABOVE the scorecard and is the ONLY blocker.
+      //
+      // Declared one-per-line on purpose: `int a = 0, b = 0, ...` is a multi-declaration, which
+      // the Jenkins CPS transformer handles badly and can blow up at runtime (plain Groovy is
+      // fine, which is why it passed local testing but posted nothing on the first real build).
+      int sObj = 0
+      int sPass = 0
+      int sFailErr = 0
+      int sSkip = 0
+      int sTests = 0
+      int sCov = 0
+      int sTot = 0
+      int sNotTestable = 0
+      int sGenFailed = 0
+      String linePct = 'n/a'
+      String subtitle = ''
+      String cardBlock = ''
+      String tableRows = ''
+      String totalRow = ''
+      // A COSMETIC formatting bug must never silence the whole comment. If anything in the
+      // scorecard build throws, log it loudly and fall back to the plain summary below.
+      boolean scorecardOk = true
+      try {
+        if (scoreRaw) {
+          String[] s = scoreRaw.split(/\s+/)
+          if (s.length >= 8) {
+            sObj = s[0] as int
+            sPass = s[2] as int
+            sFailErr = s[3] as int
+            sSkip = s[4] as int
+            sTests = s[5] as int
+            sCov = s[6] as int
+            sTot = s[7] as int
+            if (s.length >= 10) {
+              sNotTestable = s[8] as int
+              sGenFailed = s[9] as int
+            }
+          } else {
+            echo "Scorecard: unexpected counts line (${s.length} field(s)): '${scoreRaw}' - using zeros."
+          }
+        }
+        // One decimal like the reference report, via integer math (CPS-safe: no String.format).
+        if (sTot > 0) {
+          // Round to the nearest tenth. Truncating disagreed with the per-object rows, which
+          // use sprintf("%.1f") and DO round - live example: 6/14 showed 42% where the true
+          // value is 42.857%. (x*2000 + tot) / (2*tot) is round-half-up in integer math.
+          int tenths = ((sCov * 2000 + sTot) / (2 * sTot)) as int
+          linePct = "${tenths.intdiv(10)}.${tenths % 10}%"
+        }
+        int sTestable = sObj - sNotTestable
+        subtitle = "<sub>${env.MSG_DB} + ${env.DATA_DB} &middot; ${runDate} &middot; build #${env.BUILD_NUMBER} &middot; " +
+          "${sObj} object" + (sObj == 1 ? '' : 's') + " (${sTestable} testable &middot; ${sNotTestable} not testable &middot; ${sGenFailed} failed generation)</sub>"
+        // Stat cards. GitHub strips <style>/class, so the cards are an HTML table with a big
+        // numeral per cell - attributes are UNQUOTED so the JSON escaping below stays trivial.
+        String autonomyPct = sTests > 0 ? '100%' : 'n/a'
+        cardBlock = "<table>\n<tr>\n" +
+          "<td align=center><h2>${linePct}</h2><b>Line coverage</b><br><sub>" + (sTot > 0 ? "${sCov} / ${sTot} lines" : "nothing measurable") + "</sub></td>\n" +
+          "<td align=center><h2>${curTests}</h2><b>Hand-written</b><br><sub>" + (curTests == 0 ? "none in repo yet" : "${curTests - curBad} pass &middot; ${curBad} fail &middot; repo-wide") + "</sub></td>\n" +
+          "<td align=center><h2>${sTests}</h2><b>Tests</b><br><sub>${sPass} pass &middot; ${sSkip} skip &middot; ${sFailErr} fail</sub></td>\n" +
+          "<td align=center><h2>${autonomyPct}</h2><b>Autonomy</b><br><sub>${sTests} of ${sTests} auto-generated</sub></td>\n" +
+          "</tr>\n</table>"
+        if (rowsRaw) {
+          String[] rl = rowsRaw.split(/\r?\n/)
+          int cap = 20
+          tableRows = (rl.length <= cap ? rl.toList() : rl.toList().subList(0, cap)).join("\n")
+          if (rl.length > cap) { tableRows += "\n| _+${rl.length - cap} more objects_ | | | | |" }
+        } else {
+          tableRows = "| _no procedures or functions changed_ | - | - | - | - |"
+        }
+        totalRow = "| **TOTAL - ${sObj} object" + (sObj == 1 ? '' : 's') +
+          " (${sObj - sNotTestable} testable, ${sNotTestable} not)** | **${sTests}** | **${sPass}** | **${sSkip}** | **${linePct}** |"
+      } catch (Throwable sce) {
+        scorecardOk = false
+        echo "PR summary: scorecard build FAILED (${sce.getClass().getName()}: ${sce.getMessage()}) - posting the plain summary instead."
+      }
+
+      // The scorecard section, or a plain equivalent if building it threw. Either way the
+      // gate row and the check table below are always posted.
+      // One collapsed line, or nothing at all. The comment has to stay readable.
+      String curatedBlock = ''
+      if (curatedMissingRaw) {
+        String[] cm = curatedMissingRaw.split(/\s+/)
+        String firstObj = cm[0]
+        String others = cm.length > 1 ? " (+${cm.length - 1} more)" : ''
+        String csch = firstObj.split(/\./)[0]
+        if (starterSql) {
+          curatedBlock = "<details><summary>:pencil2: No hand-written test yet for <code>${firstObj}</code>${others} - ready-to-finish starter inside</summary>\n\n" +
+            "Fill in the SEED + ASSERT, then save under <code>tests/curated/${csch}/</code>. Only a person can say what the answer <i>should</i> be - the one thing the generators cannot do.\n\n" +
+            "```sql\n" + starterSql + "\n```\n</details>\n\n"
+        } else {
+          curatedBlock = "<sub>:pencil2: No hand-written test yet for <code>${firstObj}</code>${others} - a ready-to-finish starter is attached under <code>artifacts/starters/</code>.</sub>\n\n"
+        }
+      }
+
+      String scorecardBlock = scorecardOk
+        ? "### :bar_chart: Database Coverage Report\n" +
+          "${subtitle}\n\n" +
+          "${cardBlock}\n\n" +
+          "| Schema.Object | Tests | Pass | Skip | Line % |\n" +
+          "| --- | ---: | ---: | ---: | ---: |\n" +
+          "${tableRows}\n" +
+          "${totalRow}\n\n"
+        : "### :bar_chart: Coverage\n_The scorecard could not be rendered for this build (see the console log); the checks below are unaffected._\n\n"
+
+      String body = "## :test_tube: Integration Test Result: ${headline}\n\n" +
+        "Your PR's changes were deployed to a throwaway SQL Server 2022 and checked automatically. " +
+        "**Only the deploy row below blocks your PR** - the coverage scorecard is auto-generated, informational, and never stops a merge.\n\n" +
+        "> **:closed_lock_with_key: Deploys cleanly & passes integrity checks - ${deployRow.replace('**','')}**\n" +
+        "> _The only gate: confirms your schema applies to a brand-new database with no errors._\n\n" +
+        buildNotices(autoPushed, autoGenerated, refusedRaw, genFailedRaw) +
+        scorecardBlock +
+        "| Check | Result |\n" +
+        "| --- | --- |\n" +
+        "| Interface contract _(params & columns)_ | ${contractRow} |\n" +
+        "| Behaviour _(function output)_ | ${charRow} |\n" +
+        "| Hand-written regression tests _(repo-wide suite)_ | ${gateRow} |\n" +
+        "| Full details & logs | [Build #${env.BUILD_NUMBER}](${env.BUILD_URL}) |\n\n" +
+        curatedBlock +
+        whyBlock + "\n" +
+        "<sub>_Tests auto-generated by UnitAutogen (AGPL-3.0) and run with tSQLt (Apache-2.0), both pinned in `local-test/unitautogen/fetch-deps.sh`; coverage measured on the throwaway DB this build published._</sub>\n\n" +
+        "<sub>**Branch coverage is not reported.** UnitAutogen records it, but on SQL-for-Linux the UNSAFE CLR predicate parser cannot load (SAFE-only), so branch seeding is degraded and the numbers are not trustworthy - line coverage and test pass/fail are the reliable signals. Hand-written `tests/curated/` tests are what actually cover the branch logic, which is why they have their own card. " +
+        "**How to read this:** the deploy row is the gate; the scorecard is a machine best-effort and never blocks your PR - a red cell means 'regenerate a baseline', not 'broken'. " +
+        "Questions? Ping the DB team.</sub>"
+      // Tab is ESCAPED, not dropped: a raw 0x09 inside a JSON string literal is invalid (RFC 8259)
+      // and GitHub rejects the POST - which deletes the whole comment, the outcome this exists to
+      // stop. The starter block is DB-derived text, so it can carry one.
+      String esc = jsonEscape(body)
+      def resp = httpRequest(
+        url: "https://api.github.com/repos/example/${env.REPO_NAME}/issues/${pr}/comments",
+        httpMode: 'POST', contentType: 'APPLICATION_JSON',
+        customHeaders: [[name: 'Authorization', value: "Bearer ${KEY}"], [name: 'Accept', value: 'application/vnd.github+json']],
+        requestBody: "{\"body\": \"${esc}\"}",
+        validResponseCodes: '100:599')
+      echo "PR #${pr} integration-summary comment: HTTP ${resp.status}"
+    }
+  } catch (e) {
+    // Louder than before: the first real build of the scorecard posted nothing and the old
+    // one-line message made it impossible to tell why from the console log.
+    echo "PR summary comment SKIPPED — ${e.getClass().getName()}: ${e.getMessage()}"
+  }
+}
+
+// The refused list is read in three places - the stage gate, the PR comment and the commit
+// helper - and they disagreed: one fused the two kinds' files into "svcsvc", another duplicated
+// the schema. One reader, deduplicated, so the loudest signal this stage produces cannot name
+// a schema that does not exist.
+def autogenList(String kind) {
+  return sh(returnStdout: true, script: "cat artifacts/*-autogen-${kind}-*.txt 2>/dev/null | tr ' ' '\\n' | sed '/^\$/d' | sort -u | tr '\\n' ' '").trim()
+}
+
+// The PR comment is posted as hand-built JSON, so every byte JSON forbids raw in a string has
+// to be escaped here or GitHub answers 400 and the comment simply never appears. Tab matters
+// because the starter block carries DB-derived text. Its own function so it can be tested.
+@NonCPS
+def jsonEscape(String body) {
+  return body.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n').replace('\t', '\\t').replace('\r', '')
+}
+
+// Every build-level signal the stage can raise, rendered in ONE place. They kept being added to
+// the body concat and then quietly not rendered - the refusal verdict reached only an echo inside
+// autoCommitBaselines, after its early return, so on the default path nothing reported it at all.
+// One function means one place to test, and notice-rendering has its own assertions.
+@NonCPS
+def buildNotices(String autoPushed, String autoGenerated, String refusedRaw, String genFailedRaw) {
+  String out = ''
+  if (autoPushed)         out += ":robot: _This build pushed a generated baseline commit to your branch - **`git pull` before your next push**. It only adds files under `tests/contract/` and `tests/characterization/`; your own changes are untouched._\n\n"
+  else if (autoGenerated) out += ":robot: _The missing baseline was **generated and attached to this build** (`artifacts/`). Nothing was pushed - your branch is untouched and this PR is not blocked. Until that file is committed, this object simply has no interface check; drop it in from the build artifacts whenever suits._\n\n"
+  // A generator that fell over and a baseline that would have been rewritten are different news
+  // for the author: one means "read the log or retry", the other means "an object changed".
+  if (genFailedRaw)       out += ":warning: _The baseline generator failed for schema(s) **${genFailedRaw.trim().replace(' ', ', ')}**, so no baseline was created for the new objects there. Nothing in the repo was changed, and the generator log is attached to this build. This is a build-side failure, not a finding about your code._\n\n"
+  if (refusedRaw)         out += ":warning: _Adding the new baselines for schema(s) **${refusedRaw.trim().replace(' ', ', ')}** would have rewritten a baseline that already exists, so they were reverted. Blocks are only ever appended, so this should be impossible - it needs a person to look, not a retry._\n\n"
+  return out
+}
+
+// Render a whitespace-separated object list for the comment: at most four `code` spans, then a
+// count. One definition, because the same list is now printed in four places and a PR that
+// touches twenty objects must not paste twenty names into a table cell.
+// @NonCPS on all three of these, individually: a Groovy annotation binds to the NEXT
+// declaration only, so one shared annotation above the first would leave the rest
+// CPS-transformed. Not cosmetic - firstPrNumber holds a java.util.regex.Matcher in a local,
+// the textbook NotSerializableException under CPS, and postPrSummary only echoes a failure,
+// so the whole PR comment would vanish. None of the three calls a pipeline step.
+@NonCPS
+def objList(String raw) {
+  if (!raw) return ''
+  String[] o = raw.trim().split(/\s+/)
+  String out = ''
+  int shown = 0
+  for (String x : o) {
+    if (shown >= 4) break
+    if (shown > 0) out += ', '
+    out += '`' + x + '`'
+    shown++
+  }
+  if (o.length > 4) out += ', _+' + (o.length - 4) + ' more_'
+  return out
+}
+
+// The contract and characterization rows have the SAME five states, and "no tests ran" covers
+// three of them that must never share a message:
+//   raw="N M"      -> tests ran: M of N changed, or all N unchanged
+//   missing        -> it changed something with no baseline: NOTHING was checked
+//   added          -> the baseline was generated during THIS build: nothing to compare against yet
+//   neither        -> the PR really did change nothing of this kind
+// Rendering (b) as (d) is what told PR authors their PR "changed no stored procedure or
+// function" directly above a table listing the procedure it changed - observed live once this
+// pipeline started generating baselines during the same build a PR introduced a new object.
+@NonCPS
+def baselineRow(String raw, String missRaw, String addedRaw, String errRaw, String unsupRaw, boolean pushed, String notRunMsg, String genCmd) {
+  // An abort used to short-circuit here, before the counts were even looked at. With two databases
+  // that threw away a real result: AppDb_MSG_data aborting while AppDb_MSG reported "2 of 5 changed"
+  // rendered as "check did not run - nothing was verified", which hid a genuine interface change
+  // and was false besides. The abort is now reported ALONGSIDE whatever did run, and only stands
+  // alone when nothing ran at all (below).
+  String errNote = errRaw ? " _(:x: aborted - ${errRaw} - so those objects were not checked)_" : ''
+  // Declared before the branches: an object the generator cannot emit for is a fact about
+  // that object, true whether or not any test ran, and it must never render as a to-do -
+  // there is no command the author can run to clear it.
+  String unsupNote = unsupRaw ? " _(no automated baseline is possible for ${objList(unsupRaw)} - it needs a hand-written test)_" : ''
+  int t = 0
+  int bad = 0
+  if (raw) {
+    String[] c = raw.trim().split(/\s+/)
+    t = (c[0] ?: '0') as int
+    bad = (c.length > 1 ? c[1] : '0') as int
+  }
+  if (t > 0) {
+    String row = bad > 0 ? ":warning: **${bad} of ${t} changed** - regenerate the baseline if intended"
+                         : ":white_check_mark: all ${t} unchanged"
+    if (missRaw)       row += " _(no baseline yet for ${objList(missRaw)} - run `${genCmd}`)_"
+    else if (addedRaw) row += pushed ? " _(baseline created this build for ${objList(addedRaw)}, committed to your branch)_"
+                                     : " _(baseline created this build for ${objList(addedRaw)}, not committed)_"
+    return row + unsupNote + errNote
+  }
+  if (errRaw)   return ":x: **check did not run** - ${errRaw}. Nothing was verified for this PR."
+  if (missRaw)  return ":warning: **nothing checked** - no baseline yet for ${objList(missRaw)}. Run `${genCmd}` to create one." + unsupNote
+  // Generated during this build, so there was still nothing to compare against while the tests
+  // ran. Reporting that as "all unchanged" would be a pass nobody earned.
+  // Deliberately branched on whether it was actually COMMITTED. Saying "checked from the next
+  // build on" is only true when the pipeline pushed it; with AUTO_COMMIT_BASELINES off nothing
+  // commits it, the next build finds it missing again, and the promise never comes true.
+  if (addedRaw) return (pushed
+    ? ":new: **baseline created this build** for ${objList(addedRaw)} and committed to your branch - checked from the next build on."
+    : ":new: **baseline created this build** for ${objList(addedRaw)} - attached to this build, not committed, so nothing checks ${addedRaw.split(/\s+/).length == 1 ? 'it' : 'them'} until the file lands in the repo.") + unsupNote
+  if (unsupRaw) return ":information_source: **no automated baseline is possible** for ${objList(unsupRaw)} - the generator cannot produce one, so this object needs a hand-written test."
+  return notRunMsg
+}
+
+@NonCPS
+def firstPrNumber(String json) {
+  def m = (json =~ /"number"\s*:\s*(\d+)/)
+  return m.find() ? m.group(1) : null
+}
+
+// Commit the freshly generated baselines back to the PR branch, so nobody has to remember to
+// run gen-auto-tests.sh by hand. Deliberately conservative:
+//   * only files under tests/contract/ and tests/characterization/ are staged - nothing else
+//     the build may have touched;
+//   * nothing happens unless the generator actually produced a change;
+//   * a loop guard: if HEAD is already an auto-baseline commit we stop, so a non-deterministic
+//     generator can never ping-pong the branch;
+//   * the push is best-effort - a protected branch or a fork just leaves the PR comment telling
+//     the author what to run, exactly as before.
+// One phase of the baseline auto-generation, across both kinds and both databases. The CALLER
+// decides which container this runs in, because the phases need different tools: precheck and
+// verify need git (dotnet-8), generate needs sqlcmd (mssql-2022). Every invocation is || true -
+// a missing baseline must never fail somebody's build.
+def autogenPhase(String phase) {
+  sh """
+    set -e
+    git config --global --add safe.directory "*" >/dev/null 2>&1 || true
+    for kind in contract characterization; do
+      case "\$kind" in
+        contract)         main=tests/contract/AppDb_MSG;         data=tests/contract/AppDb_MSG_data ;;
+        characterization) main=tests/characterization/AppDb_MSG; data=tests/characterization/AppDb_MSG_data ;;
+      esac
+      if [ -n "\$UA_OBJECTS" ]; then
+        PHASE=${phase} KIND="\$kind" DB="\$MSG_DB" OUT_ROOT="\$main" LABEL=AppDb_MSG bash local-test/tsqlt/autogen-missing-baselines.sh || true
+      fi
+      if [ -n "\$UA_DATA_OBJECTS" ]; then
+        PHASE=${phase} KIND="\$kind" DB="\$DATA_DB" OUT_ROOT="\$data" LABEL=AppDb_MSG_data bash local-test/tsqlt/autogen-missing-baselines.sh || true
+      fi
+    done
+  """
+}
+
+def autoCommitBaselines() {
+  try {
+    // OFF by default. The baselines are still generated and archived; we simply do not touch
+    // anyone's branch. Engineers asked for no bot pushes and no change to their git workflow, and
+    // a generated file that nobody asked for is not worth a rejected `git push`.
+    if (!params.AUTO_COMMIT_BASELINES) {
+      String gen = sh(returnStdout: true, script: 'git status --porcelain -- tests/contract tests/characterization 2>/dev/null || true').trim()
+      if (gen) {
+        sh 'echo generated > artifacts/autogen-generated.txt'
+        echo 'Auto-baselines: generated and archived; not pushed (AUTO_COMMIT_BASELINES is off).'
+      }
+      return
+    }
+    String changed = sh(returnStdout: true, script: 'git status --porcelain -- tests/contract tests/characterization 2>/dev/null || true').trim()
+    if (!changed) { echo 'Auto-baselines: generator produced no change - nothing to commit.'; return }
+    // Written HERE, not only on the early returns: with the flag on, a rejected non-fast-forward
+    // push throws out of the sh below and the catch swallows it, leaving NEITHER notice file and
+    // so no banner at all - on a build that did generate a baseline. "Generated, not pushed" is
+    // the honest default for every outcome that is not a successful push.
+    sh 'echo generated > artifacts/autogen-generated.txt'
+
+    // A PR build's BRANCH_NAME is "PR-<n>", NOT the branch the author is working on - pushing
+    // HEAD to refs/heads/PR-<n> would create a junk branch nobody asked for. CHANGE_BRANCH is
+    // the real source branch on a PR build, and BRANCH_NAME is right on a plain branch build.
+    String target = (env.CHANGE_BRANCH ?: env.BRANCH_NAME ?: '').trim()
+    // Shared branches are never a push target: a bot commit there bypasses PR review and the
+    // repo's own pre-commit gates.
+    if (!target || target in ['dev', 'main', 'master'] || target.startsWith('release/')) {
+      sh 'echo generated > artifacts/autogen-generated.txt'
+      echo "Auto-baselines: '${target ?: '(unknown)'}' is a shared/unknown branch - generated and archived, never pushed."
+      return
+    }
+    // A multibranch PR job checks out the MERGE ref by default, so HEAD is a merge commit that
+    // does not belong on the contributor's branch. Push only when HEAD has a single parent.
+    String headIsMerge = sh(returnStdout: true, script: 'git rev-parse --verify --quiet HEAD^2 >/dev/null 2>&1 && echo merge || true').trim()
+    if (headIsMerge == 'merge') {
+      sh 'echo generated > artifacts/autogen-generated.txt'
+      echo 'Auto-baselines: HEAD is a PR merge commit, not the branch tip - generated and archived, never pushed.'
+      return
+    }
+
+    String lastMsg = sh(returnStdout: true, script: 'git log -1 --format=%s 2>/dev/null || true').trim()
+    if (lastMsg.contains('[auto-baseline]')) {
+      echo 'Auto-baselines: HEAD is already an auto-baseline commit - stopping to avoid a loop.'
+      return
+    }
+    String refused = autogenList('refused')
+    if (refused) {
+      echo "Auto-baselines: refused for schema(s) ${refused} - an existing baseline changed, leaving it for review."
+    }
+
+    withCredentials([usernamePassword(credentialsId: env.GITHUB_TOKEN_CREDENTIALS_ID, usernameVariable: 'APP_ID', passwordVariable: 'KEY')]) {
+     withEnv(["TARGET=${target}"]) {
+      sh """
+        set -e
+        git config user.email '${BOT_GIT_NAME}@users.noreply.github.com'
+        git config user.name  '${BOT_GIT_NAME}'
+        git add -- tests/contract tests/characterization
+        git commit -m 'PROJ-000: add generated contract baselines for new objects [auto-baseline]'                    -m 'Created by the integration-test pipeline because these objects had no baseline, so nothing could be checked. Only ADDITIONS are auto-committed; a changed existing baseline is refused and left for review.'                    --no-verify
+        # Through $TARGET, never Groovy interpolation: a branch name is attacker-controllable and
+        # git refnames permit backticks and other shell metacharacters, so interpolating the name
+        # into this script would execute it in a shell that holds the bot token. The
+        # dev/main/master guard does not stop a branch named to do that.
+        git push "https://x-access-token:\${KEY}@github.com/example/${env.REPO_NAME}.git" "HEAD:refs/heads/\${TARGET}"
+      """
+      sh 'echo pushed > artifacts/autogen-committed.txt'
+      echo "Auto-baselines: committed and pushed to ${target}."
+     }
+    }
+  } catch (e) {
+    // Never fail the build for this - the PR comment already tells the author what to run.
+    echo "Auto-baselines: skipped (${e.getClass().getName()}: ${e.getMessage()})"
+  }
+}
+
+def setBuildStatus(String state) {
+  String url = "https://api.github.com/repos/example/${env.REPO_NAME}/statuses/${env.GIT_COMMIT}"
+  String context = "Jenkins integration-test"
+  String description = getDescription(state)
+  def payload = """
+              {
+                "target_url": "${env.JOB_URL}",
+                "state": "${state}",
+                "description": "${description}",
+                "context": "${context}"
+              }"""
+  withCredentials([usernamePassword(credentialsId: env.GITHUB_TOKEN_CREDENTIALS_ID, usernameVariable: 'APP_ID', passwordVariable: 'KEY')]) {
+      def response = httpRequest contentType: 'APPLICATION_JSON',
+                             customHeaders: [[name: 'Accept', value: 'application/vnd.github.v3+json'], [name:'Authorization', value:"Bearer ${KEY}"]],
+                             httpMode: 'POST',
+                             requestBody: "${payload}",
+                             url: "${url}"
+      println('Status: ' + response.status)
+  }
+}
+
+def getDescription(String state) {
+  switch(state) {
+    case "pending":
+      return "Integration tests running"
+    case "success":
+      return "Integration tests passed"
+    case "failure":
+      return "Integration tests failed"
+    default:
+      return null
+  }
+}

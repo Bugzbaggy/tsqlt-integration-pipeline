@@ -1,0 +1,77 @@
+-- =============================================================================
+-- 00_lookups.sql — FK-parent lookup rows the MsgIntTest account/subaccount need.
+--
+-- core.Account has NOT-NULL foreign keys (each defaulting to 0 / 'ENT1') to these
+-- lookups, so the parent rows must exist before the account inserts. svc.SubAccount
+-- additionally needs protection.ProtectionStatus. All lookups here are IDENTITY(0,1)
+-- (except DimCompany/Region), so id 0 is inserted with IDENTITY_INSERT.
+-- Idempotent: safe to re-run.
+--
+-- Nullable Account FKs (ManagerId, CompanyId, PartnerId, CountryCode, VendorId) are
+-- left NULL, so core.AccountOwner / core.Company / svc.Partner / core.Country /
+-- svc.Vendor deliberately need no seed row.
+-- =============================================================================
+-- DB context comes from the sqlcmd connection (-d), so the script is DB-name-agnostic.
+-- QUOTED_IDENTIFIER/ANSI_NULLS ON are required to INSERT into tables with filtered
+-- indexes or computed columns (e.g. core.Account) — sqlcmd defaults QUOTED_IDENTIFIER OFF.
+SET NOCOUNT ON;
+SET QUOTED_IDENTIFIER ON;
+SET ANSI_NULLS ON;
+GO
+
+-- Account.CompanyEntity defaults to the schema's entity code (here 'ENT1') -> that entity must exist.
+IF NOT EXISTS (SELECT 1 FROM core.DimCompany WHERE CompanyEntity = 'ENT1')
+    INSERT core.DimCompany (CompanyEntity, Country, CompanyName)
+    VALUES ('ENT1', 'ZZ', 'Example Entity Ltd');
+GO
+
+-- Account.RegionId defaults to 0. Routing columns are placeholders for Step 1
+-- (single DB); they only matter once cross-region sends are exercised.
+IF NOT EXISTS (SELECT 1 FROM dbo.Region WHERE RegionId = 0)
+    INSERT dbo.Region (RegionId, RegionName, Country, LinkedServerName, MSG_Data_DBName)
+    VALUES (0, 'SG', 'SG', N'localhost', 'AppDb_MSG');
+GO
+
+IF NOT EXISTS (SELECT 1 FROM core.BusinessUnit WHERE BusinessUnitId = 0)
+BEGIN
+    SET IDENTITY_INSERT core.BusinessUnit ON;
+    INSERT core.BusinessUnit (BusinessUnitId, BusinessUnit) VALUES (0, 'Default');
+    SET IDENTITY_INSERT core.BusinessUnit OFF;
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM core.Tier WHERE TierId = 0)
+BEGIN
+    SET IDENTITY_INSERT core.Tier ON;
+    INSERT core.Tier (TierId, Tier) VALUES (0, 'Default');
+    SET IDENTITY_INSERT core.Tier OFF;
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM core.CustomerSegment WHERE CustomerSegmentId = 0)
+BEGIN
+    SET IDENTITY_INSERT core.CustomerSegment ON;
+    INSERT core.CustomerSegment (CustomerSegmentId, CustomerSegment) VALUES (0, 'Default');
+    SET IDENTITY_INSERT core.CustomerSegment OFF;
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM core.AccountGroup WHERE AccountGroupId = 0)
+BEGIN
+    SET IDENTITY_INSERT core.AccountGroup ON;
+    INSERT core.AccountGroup (AccountGroupId, AccountGroup) VALUES (0, 'Default');
+    SET IDENTITY_INSERT core.AccountGroup OFF;
+END
+GO
+
+-- SubAccount.ProtectionStatusId defaults to 0.
+IF NOT EXISTS (SELECT 1 FROM protection.ProtectionStatus WHERE ProtectionStatusId = 0)
+BEGIN
+    SET IDENTITY_INSERT protection.ProtectionStatus ON;
+    INSERT protection.ProtectionStatus (ProtectionStatusId, ProtectionStatus) VALUES (0, 'None');
+    SET IDENTITY_INSERT protection.ProtectionStatus OFF;
+END
+GO
+
+PRINT 'Seed 00_lookups.sql applied.';
+GO
